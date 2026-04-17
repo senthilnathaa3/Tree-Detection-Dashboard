@@ -68,6 +68,10 @@ Navigate to `http://localhost:5173`
 - **Model Variant Switch**:
   - `MODEL_VARIANT=v1` (default, ResNet18 baseline)
   - `MODEL_VARIANT=v2` (spectral stem + ResNet34 + stronger heads)
+  - `v2` now defaults to **no checkpoint loading** for clean behavior
+  - optional flags:
+    - `MODEL_V2_LOAD_CHECKPOINT=true` to allow loading default checkpoint into v2
+    - `MODEL_CHECKPOINT_PATH=/abs/path/to/checkpoint.pth` to force a specific checkpoint
 
 ### API Endpoints
 
@@ -164,6 +168,7 @@ Behavior:
 - Builds AOI bbox from `lat/lon + radius_km`.
 - If `dataset_path` is provided: runs model on local S1/S2 tiles intersecting AOI.
 - If `dataset_path` is omitted: fetches Sentinel-2 L2A + Sentinel-1 RTC from Planetary Computer using `start_date/end_date`, runs model on fetched data.
+- Supports AOI multi-sample averaging with `sample_grid_size` (e.g., `5` for 5x5 grid).
 - Computes external validation summary and model-vs-external consistency report.
 
 ### Convert FIA DataMart to Validator CSV
@@ -214,3 +219,86 @@ Response gives:
 
 The response then includes calibrated agreement fields:
 - `comparison.density_agreement_calibrated` (FIA mode)
+
+### Region-Aware Calibration
+
+Fit regional calibration (instead of one global line):
+
+`POST /api/fit-fia-calibration-regional`
+
+```json
+{
+  "calibration_csv_path": "/path/to/calibration_samples_with_region.csv",
+  "region_column": "region",
+  "min_samples_per_region": 5,
+  "output_profile_path": "/path/to/regional_calibration.json"
+}
+```
+
+Then apply in `/api/validate-location`:
+- `calibration_profile_path`
+- `calibration_region`
+
+If region fit is unavailable, API falls back to profile `global_fallback`.
+
+### Object Detection (Crown Candidates)
+
+`POST /api/detect-crowns`
+
+Params:
+- `ndvi_threshold` (default `0.45`)
+- `min_area_px` (default `12`)
+
+This endpoint performs lightweight NDVI-based connected-component detection for crown candidates and returns object-level bounding boxes/centroids.
+
+### Train V2 (Generalized AOI / State-Agnostic)
+
+Use `train_v2.py` to fine-tune `TreeSatMultiHeadModelV2` and produce checkpoints.
+
+#### Mode 1: Local paired dataset (`s1/`, `s2/`)
+
+```bash
+python3 train_v2.py \
+  --mode local \
+  --dataset-path /path/to/dataset \
+  --labels-csv /path/to/labels.csv \
+  --epochs 20 \
+  --batch-size 16 \
+  --output-dir backend/checkpoints/v2_local
+```
+
+#### Mode 2: AOI samples (WV or any state/region)
+
+CSV required columns:
+- `lat`, `lon`, `start_date`, `end_date`
+
+Optional columns:
+- `radius_km`, `cloud_cover_max`
+- density target: `density` / `tree_density`
+- species labels: `species_<label>` or direct label columns
+
+```bash
+python3 train_v2.py \
+  --mode aoi \
+  --aoi-samples-csv /path/to/aoi_samples.csv \
+  --aoi-default-radius-km 0.2 \
+  --aoi-default-cloud-cover-max 40 \
+  --aoi-cache-dir /tmp/aoi_cache \
+  --epochs 20 \
+  --batch-size 8 \
+  --output-dir backend/checkpoints/v2_aoi
+```
+
+Training outputs:
+- `best_v2.pth`
+- `last_v2.pth`
+- `train_history.csv`
+- `train_config.json`
+
+Load trained v2 checkpoint in backend:
+
+```bash
+MODEL_VARIANT=v2 \
+MODEL_CHECKPOINT_PATH=/abs/path/to/best_v2.pth \
+uvicorn backend.main:app --host 0.0.0.0 --port 8000
+```

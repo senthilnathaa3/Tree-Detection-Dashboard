@@ -9,7 +9,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 import rasterio
@@ -248,3 +248,147 @@ def run_remote_inference_planetary_computer(
         "radius_km": radius_km,
     }
     return result
+
+
+def fetch_remote_tensor_planetary_computer(
+    lat: float,
+    lon: float,
+    start_date: str,
+    end_date: str,
+    radius_km: float = 0.1,
+    cloud_cover_max: float = 40.0,
+) -> Tuple[torch.Tensor, Dict[str, Any]]:
+    """
+    Fetch remote Sentinel-1/2 data and return a model-ready 15-channel tensor.
+    Useful for training pipelines that operate on AOI samples across any state/region.
+    """
+    west, south, east, north = _bbox_from_center_radius(lat, lon, radius_km)
+    items = _search_planetary_computer_items(
+        lat,
+        lon,
+        start_date,
+        end_date,
+        cloud_cover_max=cloud_cover_max,
+    )
+    tensor = _build_15ch_tensor_from_items(items, west, south, east, north)
+    metadata = {
+        "provider": "planetary_computer",
+        "sentinel2_item_id": items.s2.id,
+        "sentinel2_datetime": items.s2.datetime.isoformat() if items.s2.datetime else None,
+        "sentinel1_item_id": items.s1.id,
+        "sentinel1_datetime": items.s1.datetime.isoformat() if items.s1.datetime else None,
+        "search_date_range": {"start": start_date, "end": end_date},
+        "cloud_cover_max": cloud_cover_max,
+        "aoi": {
+            "west": round(west, 6),
+            "south": round(south, 6),
+            "east": round(east, 6),
+            "north": round(north, 6),
+            "center_lat": round(lat, 6),
+            "center_lon": round(lon, 6),
+            "radius_km": radius_km,
+        },
+    }
+    return tensor, metadata
+
+
+def _grid_points(lat: float, lon: float, radius_km: float, grid_size: int) -> List[Tuple[float, float]]:
+    """
+    Generate evenly spaced sample points in a square grid around center.
+    grid_size=1 returns only center point.
+    """
+    import math
+
+    if grid_size <= 1:
+        return [(lat, lon)]
+
+    lat_delta = radius_km / 111.32
+    cos_lat = max(0.01, math.cos(math.radians(lat)))
+    lon_delta = radius_km / (111.32 * cos_lat)
+
+    lat_vals = np.linspace(lat - lat_delta, lat + lat_delta, grid_size)
+    lon_vals = np.linspace(lon - lon_delta, lon + lon_delta, grid_size)
+    pts: List[Tuple[float, float]] = []
+    for la in lat_vals:
+        for lo in lon_vals:
+            pts.append((float(la), float(lo)))
+    return pts
+
+
+def run_remote_inference_planetary_computer_grid(
+    lat: float,
+    lon: float,
+    start_date: str,
+    end_date: str,
+    species_threshold: float = 0.5,
+    radius_km: float = 10.0,
+    cloud_cover_max: float = 40.0,
+    grid_size: int = 5,
+) -> Dict[str, Any]:
+    """
+    Multi-sample AOI inference using an NxN grid around center.
+    Returns aggregated summary plus per-point predictions.
+    """
+    if grid_size < 1:
+        raise ValueError("grid_size must be >= 1")
+
+    pts = _grid_points(lat, lon, radius_km=radius_km, grid_size=grid_size)
+    model, device = ModelSingleton.get_model()
+
+    per_point: List[Dict[str, Any]] = []
+    failures = 0
+
+    for idx, (plat, plon) in enumerate(pts):
+        try:
+            tensor, meta = fetch_remote_tensor_planetary_computer(
+                lat=plat,
+                lon=plon,
+                start_date=start_date,
+                end_date=end_date,
+                radius_km=max(0.05, radius_km / max(grid_size, 1)),
+                cloud_cover_max=cloud_cover_max,
+            )
+            tensor = tensor.to(device)
+            with torch.no_grad():
+                density_out, species_out = model(tensor)
+
+            density = float(torch.clamp(density_out.squeeze(), 0.0, 1.0).cpu())
+            species_probs = species_out.squeeze().cpu().numpy()
+            result = _build_result(density, species_probs, species_threshold, filename=f"grid_{idx:03d}")
+            result["remote_source"] = meta
+            per_point.append(result)
+        except Exception:
+            failures += 1
+
+    if not per_point:
+        raise ValueError("No successful remote samples in AOI grid")
+
+    densities = [r["density"] for r in per_point]
+    tphs = [r["trees_per_hectare"] for r in per_point]
+    tree_counts = [r["tree_count"] for r in per_point]
+
+    dominant_counts: Dict[str, int] = {}
+    for r in per_point:
+        sp = r.get("dominant_species", "Unknown")
+        dominant_counts[sp] = dominant_counts.get(sp, 0) + 1
+
+    summary = {
+        "total_tiles_analyzed": len(per_point),
+        "mean_density": float(np.mean(densities)),
+        "avg_tree_count": float(np.mean(tree_counts)),
+        "mean_trees_per_hectare": float(np.mean(tphs)),
+        "dominant_species_distribution": dominant_counts,
+        "density_min": float(np.min(densities)),
+        "density_max": float(np.max(densities)),
+        "density_std": float(np.std(densities)),
+    }
+
+    return {
+        "mode": "remote_grid",
+        "grid_size": grid_size,
+        "samples_requested": len(pts),
+        "samples_succeeded": len(per_point),
+        "samples_failed": failures,
+        "summary": summary,
+        "per_point_predictions": per_point,
+    }

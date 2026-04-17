@@ -244,6 +244,7 @@ class ModelSingleton:
         """Load trained model from checkpoint."""
         self._device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self._variant = os.getenv("MODEL_VARIANT", "v1")
+        variant_key = (self._variant or "v1").strip().lower()
         self._model = build_model(
             variant=self._variant,
             in_channels=INPUT_CHANNELS,
@@ -251,18 +252,24 @@ class ModelSingleton:
         )
 
         checkpoints_dir = os.path.join(os.path.dirname(__file__), "checkpoints")
+        explicit_checkpoint = os.getenv("MODEL_CHECKPOINT_PATH", "").strip()
+        v2_load_checkpoint = os.getenv("MODEL_V2_LOAD_CHECKPOINT", "false").lower() == "true"
+        is_v2 = variant_key in {"v2", "treesat_v2", "treesatmultiheadmodelv2"}
+        should_load_checkpoint = (not is_v2) or v2_load_checkpoint or bool(explicit_checkpoint)
 
         # Try .pth file first, then directory format
         checkpoint_pth = os.path.join(checkpoints_dir, "best_model.pth")
         checkpoint_dir = os.path.join(checkpoints_dir, "best_model")
 
         checkpoint_path = None
-        if os.path.isfile(checkpoint_pth):
+        if explicit_checkpoint:
+            checkpoint_path = explicit_checkpoint
+        elif os.path.isfile(checkpoint_pth):
             checkpoint_path = checkpoint_pth
         elif os.path.isdir(checkpoint_dir):
             checkpoint_path = checkpoint_dir
 
-        if checkpoint_path:
+        if should_load_checkpoint and checkpoint_path:
             print(f"[ModelLoader] Loading checkpoint from {checkpoint_path}")
             checkpoint = torch.load(checkpoint_path, map_location=self._device, weights_only=False)
             strict_load = os.getenv("MODEL_STRICT_LOAD", "false").lower() == "true"
@@ -276,6 +283,9 @@ class ModelSingleton:
                 except Exception as e:
                     print(f"[ModelLoader] Could not load state dict: {e}")
                     print("[ModelLoader] Using random init for demo")
+        elif not should_load_checkpoint:
+            print("[ModelLoader] Checkpoint loading disabled for current model variant/config")
+            print("[ModelLoader] Set MODEL_V2_LOAD_CHECKPOINT=true or MODEL_CHECKPOINT_PATH to enable")
         else:
             print(f"[ModelLoader] No checkpoint found in {checkpoints_dir}")
             print("[ModelLoader] Using randomly initialized weights for demonstration")

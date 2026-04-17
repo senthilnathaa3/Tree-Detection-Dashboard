@@ -37,13 +37,22 @@ from ..worldcover_validation import (
     summarize_worldcover_aoi,
     compare_model_to_worldcover,
 )
-from ..remote_inference import run_remote_inference_planetary_computer
+from ..remote_inference import (
+    run_remote_inference_planetary_computer,
+    run_remote_inference_planetary_computer_grid,
+)
 from ..fia_datamart import build_fia_csv_from_datamart
 from ..calibration import (
     load_calibration_samples_csv,
     fit_linear_tph_calibration,
     apply_linear_tph_calibration,
+    load_regional_calibration_samples_csv,
+    fit_regional_linear_tph_calibration,
+    save_calibration_profile,
+    load_calibration_profile,
+    pick_calibration_from_profile,
 )
+from ..object_detection import detect_tree_crowns_ndvi
 
 router = APIRouter()
 
@@ -109,6 +118,9 @@ class LocationValidationRequest(BaseModel):
     year_end: Optional[int] = None
     calibration_slope: Optional[float] = None
     calibration_intercept: Optional[float] = None
+    calibration_profile_path: Optional[str] = None
+    calibration_region: Optional[str] = None
+    sample_grid_size: int = 1
 
 
 class FIADatamartConvertRequest(BaseModel):
@@ -118,6 +130,13 @@ class FIADatamartConvertRequest(BaseModel):
 
 class FIACalibrationFitRequest(BaseModel):
     calibration_csv_path: str
+
+
+class FiaRegionalCalibrationFitRequest(BaseModel):
+    calibration_csv_path: str
+    region_column: str = "region"
+    min_samples_per_region: int = 5
+    output_profile_path: Optional[str] = None
 
 
 def _validate_dataset_structure(dataset_path: str):
@@ -493,6 +512,8 @@ async def validate_location(request: LocationValidationRequest):
 
     if request.radius_km <= 0:
         raise HTTPException(status_code=400, detail="radius_km must be > 0")
+    if request.sample_grid_size < 1:
+        raise HTTPException(status_code=400, detail="sample_grid_size must be >= 1")
 
     if request.year_start is not None and request.year_end is not None:
         if request.year_start > request.year_end:
@@ -507,6 +528,7 @@ async def validate_location(request: LocationValidationRequest):
 
     model_result = None
     model_remote = None
+    model_remote_grid = None
     if request.dataset_path:
         _validate_dataset_structure(request.dataset_path)
         model_result = analyze_dataset_with_aoi(
@@ -529,40 +551,69 @@ async def validate_location(request: LocationValidationRequest):
                 detail="start_date and end_date are required for remote fetch when dataset_path is not provided.",
             )
         try:
-            model_remote = run_remote_inference_planetary_computer(
-                lat=request.lat,
-                lon=request.lon,
-                start_date=request.start_date,
-                end_date=request.end_date,
-                species_threshold=request.threshold,
-                radius_km=request.radius_km,
-                cloud_cover_max=request.cloud_cover_max,
-            )
+            if request.sample_grid_size > 1:
+                model_remote_grid = run_remote_inference_planetary_computer_grid(
+                    lat=request.lat,
+                    lon=request.lon,
+                    start_date=request.start_date,
+                    end_date=request.end_date,
+                    species_threshold=request.threshold,
+                    radius_km=request.radius_km,
+                    cloud_cover_max=request.cloud_cover_max,
+                    grid_size=request.sample_grid_size,
+                )
+            else:
+                model_remote = run_remote_inference_planetary_computer(
+                    lat=request.lat,
+                    lon=request.lon,
+                    start_date=request.start_date,
+                    end_date=request.end_date,
+                    species_threshold=request.threshold,
+                    radius_km=request.radius_km,
+                    cloud_cover_max=request.cloud_cover_max,
+                )
         except Exception as e:
             raise HTTPException(status_code=400, detail=f"Remote inference failed: {e}")
 
     model_summary = (
         model_result.get("summary", {})
         if model_result
+        else model_remote_grid.get("summary", {}) if model_remote_grid
         else _model_summary_from_single_result(model_remote) if model_remote else {}
     )
 
     calibration = None
     calibrated_model_tph = None
-    if request.calibration_slope is not None and request.calibration_intercept is not None:
+    slope = request.calibration_slope
+    intercept = request.calibration_intercept
+    calibration_source = None
+    if request.calibration_profile_path:
+        try:
+            profile = load_calibration_profile(
+                os.path.abspath(os.path.expanduser(request.calibration_profile_path))
+            )
+            slope, intercept, calibration_source = pick_calibration_from_profile(
+                profile,
+                request.calibration_region,
+            )
+        except (ValueError, FileNotFoundError) as e:
+            raise HTTPException(status_code=400, detail=f"Calibration profile error: {e}")
+
+    if slope is not None and intercept is not None:
         model_tph = model_summary.get("mean_trees_per_hectare")
         if model_tph is not None:
             calibrated_model_tph = apply_linear_tph_calibration(
                 model_tph,
-                request.calibration_slope,
-                request.calibration_intercept,
+                slope,
+                intercept,
             )
             calibration = {
                 "method": "linear",
-                "slope": request.calibration_slope,
-                "intercept": request.calibration_intercept,
+                "slope": slope,
+                "intercept": intercept,
                 "model_tph_raw": model_tph,
                 "model_tph_calibrated": round(calibrated_model_tph, 6),
+                "source": calibration_source or "request_fields",
             }
 
     if source == "fia":
@@ -587,7 +638,7 @@ async def validate_location(request: LocationValidationRequest):
         ext_summary = summarize_fia(fia_records)
         comparison = (
             compare_model_to_fia(model_summary, ext_summary)
-            if model_result or model_remote
+            if model_result or model_remote or model_remote_grid
             else {
                 "density_agreement": {
                     "model_mean_trees_per_hectare": None,
@@ -630,6 +681,7 @@ async def validate_location(request: LocationValidationRequest):
             "aoi": (
                 model_result.get("aoi", {})
                 if model_result
+                else aoi if model_remote_grid
                 else model_remote.get("aoi", {}) if model_remote else aoi
             ),
             "calibration": calibration,
@@ -644,6 +696,19 @@ async def validate_location(request: LocationValidationRequest):
                     },
                 }
                 if model_result
+                else {
+                    "status": "ran",
+                    "mode": "remote_grid",
+                    "provider": request.provider,
+                    "summary": model_summary,
+                    "tile_coverage": {
+                        "tiles_scanned": model_remote_grid.get("samples_requested", 0) if model_remote_grid else 0,
+                        "tiles_intersecting": model_remote_grid.get("samples_succeeded", 0) if model_remote_grid else 0,
+                        "scan_errors": model_remote_grid.get("samples_failed", 0) if model_remote_grid else 0,
+                    },
+                    "remote_grid": model_remote_grid if model_remote_grid else {},
+                }
+                if model_remote_grid
                 else {
                     "status": "ran",
                     "mode": "remote",
@@ -701,7 +766,7 @@ async def validate_location(request: LocationValidationRequest):
 
     comparison = (
         compare_model_to_worldcover(model_summary, wc_summary)
-        if model_result or model_remote
+        if model_result or model_remote or model_remote_grid
         else {
             "density_vs_treecover": {
                 "model_mean_density": None,
@@ -732,6 +797,7 @@ async def validate_location(request: LocationValidationRequest):
         "aoi": (
             model_result.get("aoi", {})
             if model_result
+            else aoi if model_remote_grid
             else model_remote.get("aoi", {}) if model_remote else aoi
         ),
         "calibration": calibration,
@@ -746,6 +812,19 @@ async def validate_location(request: LocationValidationRequest):
                 },
             }
             if model_result
+            else {
+                "status": "ran",
+                "mode": "remote_grid",
+                "provider": request.provider,
+                "summary": model_summary,
+                "tile_coverage": {
+                    "tiles_scanned": model_remote_grid.get("samples_requested", 0) if model_remote_grid else 0,
+                    "tiles_intersecting": model_remote_grid.get("samples_succeeded", 0) if model_remote_grid else 0,
+                    "scan_errors": model_remote_grid.get("samples_failed", 0) if model_remote_grid else 0,
+                },
+                "remote_grid": model_remote_grid if model_remote_grid else {},
+            }
+            if model_remote_grid
             else {
                 "status": "ran",
                 "mode": "remote",
@@ -833,6 +912,81 @@ async def fit_fia_calibration(request: FIACalibrationFitRequest):
         "calibration_csv_path": csv_path,
         "fit": fit,
     }
+
+
+@router.post("/fit-fia-calibration-regional")
+async def fit_fia_calibration_regional(request: FiaRegionalCalibrationFitRequest):
+    """
+    Fit region-aware linear calibration profile.
+    CSV must include: model_tph, fia_tph, and region column.
+    """
+    csv_path = os.path.abspath(os.path.expanduser(request.calibration_csv_path))
+    if not os.path.isfile(csv_path):
+        raise HTTPException(status_code=400, detail=f"Calibration CSV not found: {csv_path}")
+
+    try:
+        regional_samples = load_regional_calibration_samples_csv(
+            csv_path,
+            region_column=request.region_column,
+        )
+        profile = fit_regional_linear_tph_calibration(
+            regional_samples,
+            min_samples_per_region=request.min_samples_per_region,
+        )
+    except (ValueError, FileNotFoundError) as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Regional calibration fit failed: {e}")
+
+    saved_path = None
+    if request.output_profile_path:
+        saved_path = os.path.abspath(os.path.expanduser(request.output_profile_path))
+        try:
+            save_calibration_profile(profile, saved_path)
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"Failed to save calibration profile: {e}")
+
+    return {
+        "status": "success",
+        "calibration_csv_path": csv_path,
+        "region_column": request.region_column,
+        "profile_saved_path": saved_path,
+        "profile": profile,
+    }
+
+
+@router.post("/detect-crowns")
+async def detect_crowns(
+    file: UploadFile = File(...),
+    ndvi_threshold: float = Query(0.45, ge=-1.0, le=1.0),
+    min_area_px: int = Query(12, ge=1),
+):
+    """
+    Object-level tree crown candidate detection from an uploaded GeoTIFF.
+    Uses NDVI thresholding + connected components as a lightweight baseline.
+    """
+    content = await file.read()
+    is_valid, message = validate_file(file.filename, len(content))
+    if not is_valid:
+        raise HTTPException(status_code=400, detail=message)
+
+    save_path = save_upload(content, file.filename)
+    try:
+        result = detect_tree_crowns_ndvi(
+            tif_path=save_path,
+            ndvi_threshold=ndvi_threshold,
+            min_area_px=min_area_px,
+        )
+        result["filename"] = file.filename
+        return result
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Crown detection failed: {e}")
+    finally:
+        if os.path.exists(save_path):
+            try:
+                os.remove(save_path)
+            except OSError:
+                pass
 
 
 # ─── Single File Endpoints ──────────────────────────────────────────────
