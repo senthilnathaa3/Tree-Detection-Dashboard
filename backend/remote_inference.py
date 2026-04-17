@@ -1,0 +1,250 @@
+"""
+Remote EO fetch + inference utilities.
+
+Current provider support:
+- Planetary Computer STAC (Sentinel-2 L2A + Sentinel-1 RTC)
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
+from typing import Any, Dict, Optional, Tuple
+
+import numpy as np
+import rasterio
+import torch
+from rasterio.crs import CRS
+from rasterio.warp import transform_bounds
+from rasterio.windows import from_bounds
+
+from .inference import _build_result
+from .model_loader import ModelSingleton
+
+
+S2_BANDS = [
+    "B01", "B02", "B03", "B04", "B05", "B06", "B07",
+    "B08", "B8A", "B09", "B10", "B11", "B12",
+]
+
+S1_BANDS = ["vv", "vh"]
+
+
+@dataclass
+class SelectedItems:
+    s2: Any
+    s1: Any
+
+
+def _bbox_from_center_radius(lat: float, lon: float, radius_km: float) -> Tuple[float, float, float, float]:
+    import math
+
+    lat_delta = radius_km / 111.32
+    cos_lat = max(0.01, math.cos(math.radians(lat)))
+    lon_delta = radius_km / (111.32 * cos_lat)
+
+    west = max(-180.0, lon - lon_delta)
+    east = min(180.0, lon + lon_delta)
+    south = max(-90.0, lat - lat_delta)
+    north = min(90.0, lat + lat_delta)
+    return west, south, east, north
+
+
+def _read_asset_window(asset_href: str, west: float, south: float, east: float, north: float) -> np.ndarray:
+    with rasterio.open(asset_href) as src:
+        if src.crs and src.crs != CRS.from_epsg(4326):
+            left, bottom, right, top = transform_bounds(
+                CRS.from_epsg(4326), src.crs, west, south, east, north
+            )
+        else:
+            left, bottom, right, top = west, south, east, north
+
+        win = from_bounds(left, bottom, right, top, src.transform)
+        win = win.round_offsets().round_lengths()
+
+        # Clamp the window to dataset extents.
+        col_off = max(0, int(win.col_off))
+        row_off = max(0, int(win.row_off))
+        width = int(win.width)
+        height = int(win.height)
+
+        if col_off >= src.width or row_off >= src.height or width <= 0 or height <= 0:
+            return np.zeros((64, 64), dtype=np.float32)
+
+        width = min(width, src.width - col_off)
+        height = min(height, src.height - row_off)
+
+        arr = src.read(
+            1,
+            window=((row_off, row_off + height), (col_off, col_off + width)),
+            out_shape=(64, 64),
+            resampling=rasterio.enums.Resampling.bilinear,
+        ).astype(np.float32)
+
+        nodata = src.nodata
+        if nodata is not None:
+            arr = np.where(arr == nodata, 0.0, arr)
+
+        arr[~np.isfinite(arr)] = 0.0
+        return arr
+
+
+def _pick_best_item(items: list, prefer_low_cloud: bool = False, reference_dt: Optional[datetime] = None):
+    if not items:
+        return None
+
+    if prefer_low_cloud:
+        def cloud_key(it):
+            cc = it.properties.get("eo:cloud_cover")
+            if cc is None:
+                return 1e9
+            return float(cc)
+        return sorted(items, key=cloud_key)[0]
+
+    if reference_dt is not None:
+        def dt_distance(it):
+            dt = it.datetime
+            if dt is None:
+                return timedelta(days=9999)
+            dt_utc = dt.astimezone(timezone.utc) if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
+            ref_utc = reference_dt.astimezone(timezone.utc) if reference_dt.tzinfo else reference_dt.replace(tzinfo=timezone.utc)
+            return abs(dt_utc - ref_utc)
+        return sorted(items, key=dt_distance)[0]
+
+    return items[0]
+
+
+def _search_planetary_computer_items(
+    lat: float,
+    lon: float,
+    start_date: str,
+    end_date: str,
+    cloud_cover_max: float = 40.0,
+) -> SelectedItems:
+    try:
+        from pystac_client import Client
+        import planetary_computer
+    except ImportError as e:
+        raise RuntimeError(
+            "Missing dependencies for remote fetch. Install: pystac-client planetary-computer"
+        ) from e
+
+    catalog = Client.open("https://planetarycomputer.microsoft.com/api/stac/v1")
+
+    west, south, east, north = _bbox_from_center_radius(lat, lon, radius_km=1.5)
+    dt_range = f"{start_date}/{end_date}"
+
+    s2_search = catalog.search(
+        collections=["sentinel-2-l2a"],
+        bbox=[west, south, east, north],
+        datetime=dt_range,
+        query={"eo:cloud_cover": {"lt": cloud_cover_max}},
+        limit=100,
+    )
+    s2_items = list(s2_search.items())
+    s2 = _pick_best_item(s2_items, prefer_low_cloud=True)
+    if s2 is None:
+        raise ValueError("No Sentinel-2 L2A items found for the requested location/date range.")
+
+    s2_dt = s2.datetime
+    if s2_dt is None:
+        s1_start = start_date
+        s1_end = end_date
+    else:
+        ref = s2_dt.astimezone(timezone.utc) if s2_dt.tzinfo else s2_dt.replace(tzinfo=timezone.utc)
+        s1_start = (ref - timedelta(days=10)).date().isoformat()
+        s1_end = (ref + timedelta(days=10)).date().isoformat()
+
+    s1_search = catalog.search(
+        collections=["sentinel-1-rtc"],
+        bbox=[west, south, east, north],
+        datetime=f"{s1_start}/{s1_end}",
+        limit=100,
+    )
+    s1_items = list(s1_search.items())
+    s1 = _pick_best_item(s1_items, prefer_low_cloud=False, reference_dt=s2_dt)
+    if s1 is None:
+        raise ValueError("No Sentinel-1 RTC items found near the selected Sentinel-2 date.")
+
+    # Sign assets for authorized access.
+    s2 = planetary_computer.sign(s2)
+    s1 = planetary_computer.sign(s1)
+    return SelectedItems(s2=s2, s1=s1)
+
+
+def _build_15ch_tensor_from_items(
+    items: SelectedItems,
+    west: float,
+    south: float,
+    east: float,
+    north: float,
+) -> torch.Tensor:
+    s2_stack = []
+    for band in S2_BANDS:
+        asset = items.s2.assets.get(band)
+        if asset is None or not asset.href:
+            s2_stack.append(np.zeros((64, 64), dtype=np.float32))
+            continue
+        arr = _read_asset_window(asset.href, west, south, east, north)
+        s2_stack.append(arr / 10000.0)
+
+    s1_stack = []
+    for band in S1_BANDS:
+        asset = items.s1.assets.get(band)
+        if asset is None or not asset.href:
+            s1_stack.append(np.zeros((64, 64), dtype=np.float32))
+            continue
+        arr = _read_asset_window(asset.href, west, south, east, north)
+        s1_stack.append(arr)
+
+    stacked = np.stack(s2_stack + s1_stack, axis=0).astype(np.float32)  # (15,64,64)
+    tensor = torch.from_numpy(stacked).unsqueeze(0)  # (1,15,64,64)
+    return tensor
+
+
+def run_remote_inference_planetary_computer(
+    lat: float,
+    lon: float,
+    start_date: str,
+    end_date: str,
+    species_threshold: float = 0.5,
+    radius_km: float = 0.1,
+    cloud_cover_max: float = 40.0,
+) -> Dict[str, Any]:
+    """
+    Fetch S1/S2 from Planetary Computer by location/date and run model inference.
+    """
+    west, south, east, north = _bbox_from_center_radius(lat, lon, radius_km)
+    items = _search_planetary_computer_items(lat, lon, start_date, end_date, cloud_cover_max=cloud_cover_max)
+
+    tensor = _build_15ch_tensor_from_items(items, west, south, east, north)
+
+    model, device = ModelSingleton.get_model()
+    tensor = tensor.to(device)
+
+    with torch.no_grad():
+        density_out, species_out = model(tensor)
+
+    density = float(torch.clamp(density_out.squeeze(), 0.0, 1.0).cpu())
+    species_probs = species_out.squeeze().cpu().numpy()
+
+    result = _build_result(density, species_probs, species_threshold, filename="remote_location")
+    result["remote_source"] = {
+        "provider": "planetary_computer",
+        "sentinel2_item_id": items.s2.id,
+        "sentinel2_datetime": items.s2.datetime.isoformat() if items.s2.datetime else None,
+        "sentinel1_item_id": items.s1.id,
+        "sentinel1_datetime": items.s1.datetime.isoformat() if items.s1.datetime else None,
+        "search_date_range": {"start": start_date, "end": end_date},
+        "cloud_cover_max": cloud_cover_max,
+    }
+    result["aoi"] = {
+        "west": round(west, 6),
+        "south": round(south, 6),
+        "east": round(east, 6),
+        "north": round(north, 6),
+        "center_lat": round(lat, 6),
+        "center_lon": round(lon, 6),
+        "radius_km": radius_km,
+    }
+    return result

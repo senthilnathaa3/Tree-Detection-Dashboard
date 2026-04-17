@@ -1,0 +1,6 @@
+filename,density,tree_count,trees_per_hectare,trees_per_sqkm,dominant_species,dominant_confidence,total_species_detected,shannon_index,evenness,species_richness,biodiversity_score
+tile_0000.tif,0.49750328063964844,1990.0,497.5,49750.3,Pinus,0.5361,6,2.9931,1.6705,6,99.91
+tile_0001.tif,0.4970530867576599,1988.2,497.1,49705.3,Pinus,0.5361,6,2.9931,1.6705,6,99.91
+tile_0002.tif,0.4966879189014435,1986.8,496.7,49668.8,Pinus,0.5362,6,2.9932,1.6705,6,99.91
+tile_0003.tif,0.49572423100471497,1982.9,495.7,49572.4,Pinus,0.5377,6,2.9932,1.6705,6,99.92
+tile_0004.tif,0.49796009063720703,1991.8,498.0,49796.0,Pinus,0.536,6,2.9931,1.6705,6,99.91
