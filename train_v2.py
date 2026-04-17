@@ -35,6 +35,14 @@ from backend.remote_inference import fetch_remote_tensor_planetary_computer
 
 
 DENSITY_KEYS = ["density", "tree_density", "density_target", "tree_density_target", "target_density"]
+TPH_KEYS = [
+    "trees_per_hectare",
+    "tph",
+    "fia_tph",
+    "target_tph",
+    "tree_tph",
+    "model_tph",
+]
 
 
 def _norm_key(text: str) -> str:
@@ -84,16 +92,32 @@ def _find_density(row: Dict[str, Any]) -> Optional[float]:
     return None
 
 
+def _find_tph(row: Dict[str, Any]) -> Optional[float]:
+    for key in TPH_KEYS:
+        if key in row:
+            return _parse_float(row[key])
+    return None
+
+
 @dataclass
 class LabelRow:
     density: Optional[float]
+    tph: Optional[float]
     species: np.ndarray
 
 
 class LocalPairedDataset(Dataset):
-    def __init__(self, dataset_path: str, labels_csv: str):
+    def __init__(
+        self,
+        dataset_path: str,
+        labels_csv: str,
+        density_target_mode: str = "tph",
+        tph_reference: float = 1000.0,
+    ):
         self.pairs = discover_dataset(dataset_path)
         self.by_filename = {os.path.basename(s2): (s2, s1) for s2, s1 in self.pairs}
+        self.density_target_mode = (density_target_mode or "tph").strip().lower()
+        self.tph_reference = float(tph_reference)
         self.labels = self._load_labels(labels_csv)
         self.keys = sorted(set(self.by_filename.keys()) & set(self.labels.keys()))
 
@@ -126,9 +150,9 @@ class LocalPairedDataset(Dataset):
                 if not fname:
                     continue
 
-                density = _find_density({k.lower(): v for k, v in row.items() if isinstance(k, str)})
-                if density is None:
-                    density = 0.0
+                lowered = {k.lower(): v for k, v in row.items() if isinstance(k, str)}
+                density = _find_density(lowered)
+                tph = _find_tph(lowered)
 
                 species = np.zeros(len(SPECIES_LABELS), dtype=np.float32)
                 for i, sp in enumerate(SPECIES_LABELS):
@@ -136,7 +160,11 @@ class LocalPairedDataset(Dataset):
                     if col is not None:
                         species[i] = float(_parse_binary(row.get(col)))
 
-                out[fname] = LabelRow(density=float(density), species=species)
+                out[fname] = LabelRow(
+                    density=float(density) if density is not None else None,
+                    tph=float(tph) if tph is not None else None,
+                    species=species,
+                )
 
         return out
 
@@ -148,7 +176,19 @@ class LocalPairedDataset(Dataset):
         s2_path, s1_path = self.by_filename[fname]
         tensor = preprocess_paired_s1_s2(s2_path, s1_path).squeeze(0).float()  # (15,64,64)
         label = self.labels[fname]
-        density = torch.tensor([label.density], dtype=torch.float32)
+        if self.density_target_mode == "tph":
+            target = (
+                float(label.tph)
+                if label.tph is not None
+                else float(label.density or 0.0) * self.tph_reference
+            )
+        else:
+            target = (
+                float(label.density)
+                if label.density is not None
+                else float(label.tph or 0.0) / max(1e-6, self.tph_reference)
+            )
+        density = torch.tensor([target], dtype=torch.float32)
         species = torch.tensor(label.species, dtype=torch.float32)
         return tensor, density, species
 
@@ -177,12 +217,16 @@ class AOISampleDataset(Dataset):
         default_radius_km: float,
         default_cloud_cover_max: float,
         cache_dir: Optional[str] = None,
+        density_target_mode: str = "tph",
+        tph_reference: float = 1000.0,
     ):
         if not os.path.isfile(samples_csv):
             raise FileNotFoundError(f"AOI samples CSV not found: {samples_csv}")
 
         self.default_radius_km = float(default_radius_km)
         self.default_cloud_cover_max = float(default_cloud_cover_max)
+        self.density_target_mode = (density_target_mode or "tph").strip().lower()
+        self.tph_reference = float(tph_reference)
         self.cache_dir = cache_dir
         if self.cache_dir:
             os.makedirs(self.cache_dir, exist_ok=True)
@@ -219,9 +263,9 @@ class AOISampleDataset(Dataset):
                 radius_km = _parse_float(row.get(low.get("radius_km", "")))
                 cloud_cover_max = _parse_float(row.get(low.get("cloud_cover_max", "")))
 
-                density = _find_density({k.lower(): v for k, v in row.items() if isinstance(k, str)})
-                if density is None:
-                    density = 0.0
+                lowered = {k.lower(): v for k, v in row.items() if isinstance(k, str)}
+                density = _find_density(lowered)
+                tph = _find_tph(lowered)
 
                 species = np.zeros(len(SPECIES_LABELS), dtype=np.float32)
                 for i, sp in enumerate(SPECIES_LABELS):
@@ -237,7 +281,8 @@ class AOISampleDataset(Dataset):
                         "end_date": end_date,
                         "radius_km": float(radius_km) if radius_km is not None else self.default_radius_km,
                         "cloud_cover_max": float(cloud_cover_max) if cloud_cover_max is not None else self.default_cloud_cover_max,
-                        "density": float(density),
+                        "density": float(density) if density is not None else None,
+                        "tph": float(tph) if tph is not None else None,
                         "species": species,
                     }
                 )
@@ -275,7 +320,19 @@ class AOISampleDataset(Dataset):
             if self.cache_dir:
                 np.save(npy_path, tensor.numpy())
 
-        density = torch.tensor([row["density"]], dtype=torch.float32)
+        if self.density_target_mode == "tph":
+            target = (
+                float(row["tph"])
+                if row.get("tph") is not None
+                else float(row.get("density") or 0.0) * self.tph_reference
+            )
+        else:
+            target = (
+                float(row["density"])
+                if row.get("density") is not None
+                else float(row.get("tph") or 0.0) / max(1e-6, self.tph_reference)
+            )
+        density = torch.tensor([target], dtype=torch.float32)
         species = torch.tensor(row["species"], dtype=torch.float32)
         return tensor, density, species
 
@@ -295,17 +352,22 @@ def run_epoch(
     optimizer: Optional[torch.optim.Optimizer],
     density_loss_weight: float,
     species_loss_weight: float,
+    density_loss_kind: str = "huber",
 ):
     train_mode = optimizer is not None
     model.train(train_mode)
 
     mse = nn.MSELoss()
+    l1 = nn.L1Loss()
+    huber = nn.SmoothL1Loss(beta=1.0)
     bce = nn.BCELoss()
 
     total_loss = 0.0
     total_density = 0.0
     total_species = 0.0
     n = 0
+    preds: List[float] = []
+    trues: List[float] = []
 
     for x, d_true, y_true in loader:
         x = x.to(device)
@@ -317,12 +379,20 @@ def run_epoch(
 
         with torch.set_grad_enabled(train_mode):
             d_pred, y_pred = model(x)
-            loss_d = mse(d_pred, d_true)
+            if density_loss_kind == "l1":
+                loss_d = l1(d_pred, d_true)
+            elif density_loss_kind == "mse":
+                loss_d = mse(d_pred, d_true)
+            else:
+                loss_d = huber(d_pred, d_true)
             loss_s = bce(y_pred, y_true)
             loss = density_loss_weight * loss_d + species_loss_weight * loss_s
             if train_mode:
                 loss.backward()
                 optimizer.step()
+
+        preds.extend(d_pred.detach().cpu().numpy().reshape(-1).tolist())
+        trues.extend(d_true.detach().cpu().numpy().reshape(-1).tolist())
 
         bs = x.size(0)
         total_loss += float(loss.item()) * bs
@@ -331,13 +401,52 @@ def run_epoch(
         n += bs
 
     if n == 0:
-        return {"loss": 0.0, "density_loss": 0.0, "species_loss": 0.0}
+        return {"loss": 0.0, "density_loss": 0.0, "species_loss": 0.0, "mae": 0.0, "rmse": 0.0, "mape": 0.0}
+
+    pred_arr = np.asarray(preds, dtype=np.float64)
+    true_arr = np.asarray(trues, dtype=np.float64)
+    abs_err = np.abs(pred_arr - true_arr)
+    mae = float(np.mean(abs_err))
+    rmse = float(np.sqrt(np.mean((pred_arr - true_arr) ** 2)))
+    nz = np.abs(true_arr) > 1e-6
+    mape = float(np.mean(abs_err[nz] / np.abs(true_arr[nz])) * 100.0) if np.any(nz) else 0.0
 
     return {
         "loss": total_loss / n,
         "density_loss": total_density / n,
         "species_loss": total_species / n,
+        "mae": mae,
+        "rmse": rmse,
+        "mape": mape,
     }
+
+
+def evaluate_regression_on_loader(model: nn.Module, loader: DataLoader, device: torch.device) -> Dict[str, float]:
+    model.eval()
+    preds: List[float] = []
+    trues: List[float] = []
+    with torch.no_grad():
+        for x, d_true, _y_true in loader:
+            x = x.to(device)
+            d_true = d_true.to(device)
+            d_pred, _ = model(x)
+            preds.extend(d_pred.detach().cpu().numpy().reshape(-1).tolist())
+            trues.extend(d_true.detach().cpu().numpy().reshape(-1).tolist())
+
+    if not trues:
+        return {"count": 0, "mae": 0.0, "rmse": 0.0, "mape": 0.0, "r2": 0.0}
+
+    pred_arr = np.asarray(preds, dtype=np.float64)
+    true_arr = np.asarray(trues, dtype=np.float64)
+    abs_err = np.abs(pred_arr - true_arr)
+    mae = float(np.mean(abs_err))
+    rmse = float(np.sqrt(np.mean((pred_arr - true_arr) ** 2)))
+    nz = np.abs(true_arr) > 1e-6
+    mape = float(np.mean(abs_err[nz] / np.abs(true_arr[nz])) * 100.0) if np.any(nz) else 0.0
+    sst = float(np.sum((true_arr - np.mean(true_arr)) ** 2))
+    sse = float(np.sum((pred_arr - true_arr) ** 2))
+    r2 = float(1.0 - (sse / sst)) if sst > 1e-9 else 0.0
+    return {"count": int(len(true_arr)), "mae": mae, "rmse": rmse, "mape": mape, "r2": r2}
 
 
 def save_checkpoint(path: str, payload: Dict[str, Any]):
@@ -366,6 +475,10 @@ def parse_args() -> argparse.Namespace:
 
     p.add_argument("--density-loss-weight", type=float, default=1.0)
     p.add_argument("--species-loss-weight", type=float, default=1.0)
+    p.add_argument("--density-target-mode", choices=["normalized", "tph"], default="tph")
+    p.add_argument("--tph-reference", type=float, default=1000.0)
+    p.add_argument("--density-loss-kind", choices=["huber", "mse", "l1"], default="huber")
+    p.add_argument("--holdout-csv", default="", help="Optional holdout CSV (same schema as training mode) for final raw metric report.")
 
     p.add_argument("--output-dir", default="backend/checkpoints/v2")
     p.add_argument("--resume-checkpoint", default="")
@@ -383,7 +496,12 @@ def main() -> int:
     if args.mode == "local":
         if not args.dataset_path or not args.labels_csv:
             raise ValueError("local mode requires --dataset-path and --labels-csv")
-        dataset = LocalPairedDataset(args.dataset_path, args.labels_csv)
+        dataset = LocalPairedDataset(
+            args.dataset_path,
+            args.labels_csv,
+            density_target_mode=args.density_target_mode,
+            tph_reference=args.tph_reference,
+        )
     else:
         if not args.aoi_samples_csv:
             raise ValueError("aoi mode requires --aoi-samples-csv")
@@ -392,6 +510,8 @@ def main() -> int:
             default_radius_km=args.aoi_default_radius_km,
             default_cloud_cover_max=args.aoi_default_cloud_cover_max,
             cache_dir=args.aoi_cache_dir or None,
+            density_target_mode=args.density_target_mode,
+            tph_reference=args.tph_reference,
         )
 
     total = len(dataset)
@@ -422,8 +542,34 @@ def main() -> int:
     )
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model = TreeSatMultiHeadModelV2().to(device)
+    model = TreeSatMultiHeadModelV2(density_mode=args.density_target_mode).to(device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+
+    holdout_loader = None
+    if args.holdout_csv:
+        if args.mode == "local":
+            holdout_ds = LocalPairedDataset(
+                args.dataset_path,
+                args.holdout_csv,
+                density_target_mode=args.density_target_mode,
+                tph_reference=args.tph_reference,
+            )
+        else:
+            holdout_ds = AOISampleDataset(
+                samples_csv=args.holdout_csv,
+                default_radius_km=args.aoi_default_radius_km,
+                default_cloud_cover_max=args.aoi_default_cloud_cover_max,
+                cache_dir=args.aoi_cache_dir or None,
+                density_target_mode=args.density_target_mode,
+                tph_reference=args.tph_reference,
+            )
+        holdout_loader = DataLoader(
+            holdout_ds,
+            batch_size=args.batch_size,
+            shuffle=False,
+            num_workers=args.num_workers,
+            collate_fn=collate_batch,
+        )
 
     start_epoch = 1
     best_val = float("inf")
@@ -460,6 +606,7 @@ def main() -> int:
             optimizer,
             density_loss_weight=args.density_loss_weight,
             species_loss_weight=args.species_loss_weight,
+            density_loss_kind=args.density_loss_kind,
         )
         val_metrics = run_epoch(
             model,
@@ -468,6 +615,7 @@ def main() -> int:
             optimizer=None,
             density_loss_weight=args.density_loss_weight,
             species_loss_weight=args.species_loss_weight,
+            density_loss_kind=args.density_loss_kind,
         )
 
         row = {
@@ -475,9 +623,15 @@ def main() -> int:
             "train_loss": train_metrics["loss"],
             "train_density_loss": train_metrics["density_loss"],
             "train_species_loss": train_metrics["species_loss"],
+            "train_mae": train_metrics["mae"],
+            "train_rmse": train_metrics["rmse"],
+            "train_mape": train_metrics["mape"],
             "val_loss": val_metrics["loss"],
             "val_density_loss": val_metrics["density_loss"],
             "val_species_loss": val_metrics["species_loss"],
+            "val_mae": val_metrics["mae"],
+            "val_rmse": val_metrics["rmse"],
+            "val_mape": val_metrics["mape"],
             "seconds": round(time.time() - t0, 2),
         }
         history_rows.append(row)
@@ -486,7 +640,8 @@ def main() -> int:
             f"[Epoch {epoch:03d}] "
             f"train={row['train_loss']:.6f} "
             f"val={row['val_loss']:.6f} "
-            f"(density={row['val_density_loss']:.6f}, species={row['val_species_loss']:.6f})"
+            f"(density={row['val_density_loss']:.6f}, species={row['val_species_loss']:.6f}, "
+            f"val_mae={row['val_mae']:.4f}, val_mape={row['val_mape']:.2f}%)"
         )
 
         checkpoint_payload = {
@@ -498,6 +653,7 @@ def main() -> int:
             "val_metrics": val_metrics,
             "timestamp_utc": datetime.utcnow().isoformat() + "Z",
             "model_variant": "v2",
+            "density_target_mode": args.density_target_mode,
             "train_config": vars(args),
         }
         save_checkpoint(last_path, checkpoint_payload)
@@ -517,6 +673,21 @@ def main() -> int:
     print(f"Best checkpoint: {best_path}")
     print(f"Last checkpoint: {last_path}")
     print(f"History CSV: {history_path}")
+
+    holdout_summary = None
+    if holdout_loader is not None:
+        best_ckpt = torch.load(best_path, map_location=device, weights_only=False)
+        if isinstance(best_ckpt, dict) and "model_state_dict" in best_ckpt:
+            model.load_state_dict(best_ckpt["model_state_dict"], strict=False)
+        holdout_summary = evaluate_regression_on_loader(model, holdout_loader, device)
+        holdout_summary["target_mode"] = args.density_target_mode
+        holdout_summary["metric_units"] = "tph" if args.density_target_mode == "tph" else "normalized_density"
+        holdout_path = os.path.join(args.output_dir, "holdout_metrics.json")
+        with open(holdout_path, "w", encoding="utf-8") as f:
+            json.dump(holdout_summary, f, indent=2)
+        print(f"Holdout metrics: {holdout_path}")
+        print(json.dumps(holdout_summary, indent=2))
+
     return 0
 
 

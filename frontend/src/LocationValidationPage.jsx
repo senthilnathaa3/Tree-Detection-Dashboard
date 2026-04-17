@@ -1,4 +1,4 @@
-import { useMemo, useState } from 'react';
+import { useEffect, useMemo, useState } from 'react';
 import {
   Bar,
   BarChart,
@@ -32,6 +32,7 @@ const FOREST_PRESET = {
   calibration_region: '',
   sample_grid_size: 1,
 };
+const LAST_RUN_STORAGE_KEY = 'location_validation_last_run_v1';
 
 function NumberInput({ label, value, onChange, step = 'any', min, max }) {
   return (
@@ -101,6 +102,7 @@ export default function LocationValidationPage() {
   const [crownResult, setCrownResult] = useState(null);
   const [isDetectionExpanded, setIsDetectionExpanded] = useState(false);
   const [shouldAlignWithModel, setShouldAlignWithModel] = useState(true);
+  const [lastRunLoadedAt, setLastRunLoadedAt] = useState('');
 
   const isFIA = form.validation_source === 'fia';
 
@@ -141,6 +143,35 @@ export default function LocationValidationPage() {
     setForm((prev) => ({ ...prev, [key]: value }));
   };
 
+  const clearCachedRun = () => {
+    try {
+      window.localStorage.removeItem(LAST_RUN_STORAGE_KEY);
+    } catch {
+      // Ignore storage errors.
+    }
+    setLastRunLoadedAt('');
+  };
+
+  useEffect(() => {
+    try {
+      const raw = window.localStorage.getItem(LAST_RUN_STORAGE_KEY);
+      if (!raw) return;
+      const parsed = JSON.parse(raw);
+      if (parsed?.form && typeof parsed.form === 'object') {
+        setForm((prev) => ({ ...prev, ...parsed.form }));
+      }
+      if (parsed?.result && typeof parsed.result === 'object') {
+        setResult(parsed.result);
+        setIsConfigExpanded(false);
+      }
+      if (parsed?.saved_at) {
+        setLastRunLoadedAt(parsed.saved_at);
+      }
+    } catch {
+      // Ignore localStorage parsing issues and fall back to defaults.
+    }
+  }, []);
+
   const onSubmit = async (e) => {
     e.preventDefault();
     setLoading(true);
@@ -150,6 +181,20 @@ export default function LocationValidationPage() {
       const data = await validateLocation(payload);
       setResult(data);
       setIsConfigExpanded(false);
+      const savedAt = new Date().toISOString();
+      setLastRunLoadedAt(savedAt);
+      try {
+        window.localStorage.setItem(
+          LAST_RUN_STORAGE_KEY,
+          JSON.stringify({
+            saved_at: savedAt,
+            form,
+            result: data,
+          }),
+        );
+      } catch {
+        // Ignore storage quota or serialization errors.
+      }
     } catch (err) {
       setError(err.message || 'Location validation failed');
     } finally {
@@ -235,9 +280,13 @@ export default function LocationValidationPage() {
 
     const rawAccuracy = accuracyFromPercentDiff(rawPct);
     const calibratedAccuracy = accuracyFromPercentDiff(calPct);
+    const effectiveCalibratedTPH = calibratedTPH ?? modelTPH;
+    const effectiveCalibratedAccuracy = calibratedAccuracy ?? rawAccuracy;
+    const calibrationApplied = calibratedTPH !== null && calibratedTPH !== undefined;
 
-    const modelTreeCount = prediction.tree_count ?? modelSummary.avg_tree_count ?? null;
-    const fiaTreeCountEstimate = fiaTPH !== null ? Number(fiaTPH) * 4 : null;
+    const modelTreeCount = modelSummary.aoi_total_tree_count ?? prediction.tree_count ?? modelSummary.avg_tree_count ?? null;
+    const aoiAreaHa = modelSummary.aoi_area_ha ?? 4;
+    const fiaTreeCountEstimate = fiaTPH !== null ? Number(fiaTPH) * aoiAreaHa : null;
 
     const tphChartData = [
       { metric: 'Model (Raw)', value: modelTPH, fill: '#3b82f6' },
@@ -247,7 +296,7 @@ export default function LocationValidationPage() {
 
     const treeCountChartData = [
       { metric: 'Model Tree Count', value: modelTreeCount, fill: '#0ea5e9' },
-      { metric: 'FIA Tree Count (4ha est.)', value: fiaTreeCountEstimate, fill: '#22c55e' },
+      { metric: `FIA Count (${fmtNum(aoiAreaHa, 0)}ha est.)`, value: fiaTreeCountEstimate, fill: '#22c55e' },
     ].filter((d) => d.value !== null && d.value !== undefined);
 
     return {
@@ -256,10 +305,14 @@ export default function LocationValidationPage() {
       calibratedTPH,
       modelTreeCount,
       fiaTreeCountEstimate,
+      aoiAreaHa,
       rawPct,
       calPct,
       rawAccuracy,
       calibratedAccuracy,
+      effectiveCalibratedTPH,
+      effectiveCalibratedAccuracy,
+      calibrationApplied,
       tphChartData,
       treeCountChartData,
     };
@@ -284,6 +337,15 @@ export default function LocationValidationPage() {
           </a>
         </div>
       </header>
+
+      {lastRunLoadedAt ? (
+        <div style={styles.cacheBanner}>
+          <span>Showing cached validation run from {new Date(lastRunLoadedAt).toLocaleString()}.</span>
+          <button type="button" style={styles.cacheClearBtn} onClick={clearCachedRun}>
+            Clear Cached Run
+          </button>
+        </div>
+      ) : null}
 
       <div style={styles.formCard}>
         {isConfigExpanded && (
@@ -419,14 +481,22 @@ export default function LocationValidationPage() {
               />
               <MetricCard
                 title="Agreement Accuracy (Calibrated)"
-                value={insights.calibratedAccuracy === null ? '—' : `${fmtNum(insights.calibratedAccuracy, 2)}%`}
-                subtitle="Shown when calibration is provided"
+                value={
+                  insights.effectiveCalibratedAccuracy === null
+                    ? '—'
+                    : `${fmtNum(insights.effectiveCalibratedAccuracy, 2)}%`
+                }
+                subtitle={
+                  insights.calibrationApplied
+                    ? 'Calibrated estimate'
+                    : 'No calibration provided; showing raw'
+                }
                 tone="purple"
               />
               <MetricCard
-                title="Model TPH (Raw)"
-                value={fmtNum(insights.modelTPH, 2)}
-                subtitle="Trees per hectare"
+                title="Model TPH (Calibrated)"
+                value={fmtNum(insights.effectiveCalibratedTPH, 2)}
+                subtitle={insights.calibrationApplied ? 'Calibrated trees per hectare' : 'No calibration; showing raw'}
                 tone="sky"
               />
               <MetricCard
@@ -482,7 +552,7 @@ export default function LocationValidationPage() {
                     </Bar>
                   </BarChart>
                 </ResponsiveContainer>
-                <div style={styles.smallNote}>FIA tree count is estimated from FIA TPH x 4 hectares for side-by-side pitch visualization.</div>
+                <div style={styles.smallNote}>FIA tree count is extrapolated from FIA TPH across the full AOI area ({fmtNum(insights.aoiAreaHa, 0)} hectares) for side-by-side pitch visualization.</div>
               </div>
             </div>
           </section>
@@ -709,6 +779,30 @@ const styles = {
   h1: { margin: 0, fontSize: '1.6rem', fontWeight: 700, letterSpacing: '-0.025em' },
   h2: { margin: '0 0 16px 0', fontSize: '1.1rem', fontWeight: 600, color: 'var(--text-primary)' },
   sub: { margin: '4px 0 0 0', color: 'var(--text-muted)', fontSize: '0.9rem' },
+  cacheBanner: {
+    maxWidth: 1200,
+    margin: '0 auto 12px',
+    borderRadius: 10,
+    border: '1px solid rgba(14, 165, 233, 0.35)',
+    background: 'rgba(14, 165, 233, 0.08)',
+    color: 'var(--text-secondary)',
+    padding: '10px 12px',
+    fontSize: '0.8rem',
+    display: 'flex',
+    justifyContent: 'space-between',
+    alignItems: 'center',
+    gap: 12,
+  },
+  cacheClearBtn: {
+    background: 'transparent',
+    color: 'var(--text-primary)',
+    border: '1px solid var(--border-color)',
+    borderRadius: 8,
+    padding: '6px 10px',
+    cursor: 'pointer',
+    fontSize: '0.75rem',
+    fontFamily: 'var(--font-sans)',
+  },
   linkBtn: {
     color: 'var(--text-primary)',
     background: 'var(--bg-elevated)',

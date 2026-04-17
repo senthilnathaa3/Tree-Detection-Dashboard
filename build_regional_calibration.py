@@ -77,6 +77,13 @@ def _discover_state_zip_pairs(fia_zips_dir: str) -> List[StateZipPair]:
     return pairs
 
 
+def _filter_pairs_by_states(pairs: List[StateZipPair], states: List[str]) -> List[StateZipPair]:
+    if not states:
+        return pairs
+    wanted = {s.strip().upper() for s in states if s.strip()}
+    return [p for p in pairs if p.state in wanted]
+
+
 def _download_file(url: str, out_path: str, timeout_sec: int = 120):
     r = requests.get(url, stream=True, timeout=timeout_sec)
     if r.status_code != 200:
@@ -340,8 +347,11 @@ def main():
             skip_existing=args.download_skip_existing,
         )
 
+    requested_states = [s.strip().upper() for s in args.states.split(",") if s.strip()]
+
     print("[step] discovering FIA zip pairs...")
     pairs = _discover_state_zip_pairs(args.fia_zips_dir)
+    pairs = _filter_pairs_by_states(pairs, requested_states)
     if not pairs:
         raise ValueError(
             "No valid state zip pairs found. Expect files like WV_PLOT.zip and WV_TREE.zip."

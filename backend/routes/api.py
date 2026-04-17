@@ -596,6 +596,21 @@ async def validate_location(request: LocationValidationRequest):
         else _model_summary_from_single_result(model_remote) if model_remote else {}
     )
 
+    # ─── AOI Extrapolation ───
+    # Extrapolate mean TPH to the full AOI area
+    aoi_area_ha = aoi.get("area_km2", 0.0) * 100.0
+    if not aoi_area_ha:
+        # Fallback calculation if area_km2 missing
+        lat_delta = request.radius_km / 111.32
+        import math
+        cos_lat = math.cos(math.radians(request.lat))
+        lon_delta = request.radius_km / (111.32 * cos_lat)
+        aoi_area_ha = (math.pi * request.radius_km**2) * 100.0 # Circle area in hectares
+
+    mean_tph = model_summary.get("mean_trees_per_hectare", 0.0)
+    model_summary["aoi_area_ha"] = round(aoi_area_ha, 2)
+    model_summary["aoi_total_tree_count"] = round(mean_tph * aoi_area_ha, 1)
+
     calibration = None
     calibrated_model_tph = None
     slope = request.calibration_slope
@@ -1020,6 +1035,14 @@ async def fetch_remote_geotiff(request: RemoteGeoTiffFetchRequest, background_ta
     if request.radius_km <= 0:
         raise HTTPException(status_code=400, detail="radius_km must be > 0.")
 
+    # Calculate a reasonable output shape for the GeoTIFF (target ~10m resolution, Sentinel-2 native)
+    # Radius of 0.2km = 400m side. at 10m/px = 40x40 px.
+    # Radius of 10km = 20000m side. at 10m/px = 2000x2000 px (we cap at 1024 to be safe)
+    side_meters = request.radius_km * 2000
+    target_res_meters = 10.0
+    pixels = int(min(1024, max(64, side_meters / target_res_meters)))
+    out_shape = (pixels, pixels)
+
     try:
         tensor, metadata = fetch_remote_tensor_planetary_computer(
             lat=request.lat,
@@ -1028,6 +1051,7 @@ async def fetch_remote_geotiff(request: RemoteGeoTiffFetchRequest, background_ta
             end_date=request.end_date,
             radius_km=request.radius_km,
             cloud_cover_max=request.cloud_cover_max,
+            out_shape=out_shape,
         )
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"Remote fetch failed: {e}")

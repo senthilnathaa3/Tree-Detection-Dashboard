@@ -18,7 +18,7 @@ from rasterio.crs import CRS
 from rasterio.warp import transform_bounds
 from rasterio.windows import from_bounds
 
-from .inference import _build_result
+from .inference import _build_result, postprocess_density_output
 from .model_loader import ModelSingleton
 
 
@@ -50,7 +50,14 @@ def _bbox_from_center_radius(lat: float, lon: float, radius_km: float) -> Tuple[
     return west, south, east, north
 
 
-def _read_asset_window(asset_href: str, west: float, south: float, east: float, north: float) -> np.ndarray:
+def _read_asset_window(
+    asset_href: str, 
+    west: float, 
+    south: float, 
+    east: float, 
+    north: float,
+    out_shape: Optional[Tuple[int, int]] = (64, 64)
+) -> np.ndarray:
     with rasterio.open(asset_href) as src:
         if src.crs and src.crs != CRS.from_epsg(4326):
             left, bottom, right, top = transform_bounds(
@@ -69,17 +76,21 @@ def _read_asset_window(asset_href: str, west: float, south: float, east: float, 
         height = int(win.height)
 
         if col_off >= src.width or row_off >= src.height or width <= 0 or height <= 0:
-            return np.zeros((64, 64), dtype=np.float32)
+            shape = out_shape or (64, 64)
+            return np.zeros(shape, dtype=np.float32)
 
         width = min(width, src.width - col_off)
         height = min(height, src.height - row_off)
 
-        arr = src.read(
-            1,
-            window=((row_off, row_off + height), (col_off, col_off + width)),
-            out_shape=(64, 64),
-            resampling=rasterio.enums.Resampling.bilinear,
-        ).astype(np.float32)
+        # If out_shape is None, we read at native resolution for that window
+        read_kwargs = {
+            "window": ((row_off, row_off + height), (col_off, col_off + width)),
+            "resampling": rasterio.enums.Resampling.bilinear,
+        }
+        if out_shape:
+            read_kwargs["out_shape"] = out_shape
+
+        arr = src.read(1, **read_kwargs).astype(np.float32)
 
         nodata = src.nodata
         if nodata is not None:
@@ -178,27 +189,30 @@ def _build_15ch_tensor_from_items(
     south: float,
     east: float,
     north: float,
+    out_shape: Optional[Tuple[int, int]] = (64, 64)
 ) -> torch.Tensor:
     s2_stack = []
     for band in S2_BANDS:
         asset = items.s2.assets.get(band)
         if asset is None or not asset.href:
-            s2_stack.append(np.zeros((64, 64), dtype=np.float32))
+            shape = out_shape or (64, 64)
+            s2_stack.append(np.zeros(shape, dtype=np.float32))
             continue
-        arr = _read_asset_window(asset.href, west, south, east, north)
+        arr = _read_asset_window(asset.href, west, south, east, north, out_shape=out_shape)
         s2_stack.append(arr / 10000.0)
 
     s1_stack = []
     for band in S1_BANDS:
         asset = items.s1.assets.get(band)
         if asset is None or not asset.href:
-            s1_stack.append(np.zeros((64, 64), dtype=np.float32))
+            shape = out_shape or (64, 64)
+            s1_stack.append(np.zeros(shape, dtype=np.float32))
             continue
-        arr = _read_asset_window(asset.href, west, south, east, north)
+        arr = _read_asset_window(asset.href, west, south, east, north, out_shape=out_shape)
         s1_stack.append(arr)
 
-    stacked = np.stack(s2_stack + s1_stack, axis=0).astype(np.float32)  # (15,64,64)
-    tensor = torch.from_numpy(stacked).unsqueeze(0)  # (1,15,64,64)
+    stacked = np.stack(s2_stack + s1_stack, axis=0).astype(np.float32)
+    tensor = torch.from_numpy(stacked).unsqueeze(0)
     return tensor
 
 
@@ -214,12 +228,13 @@ def run_remote_inference_planetary_computer(
     """
     Fetch S1/S2 from Planetary Computer by location/date and run model inference.
     """
-    # Always use a standard 200m patch (0.1km radius) for the model, regardless of AOI
+    # Always use a standard 200m patch (0.1km radius) for the model
     patch_radius = 0.1
     west, south, east, north = _bbox_from_center_radius(lat, lon, patch_radius)
     items = _search_planetary_computer_items(lat, lon, start_date, end_date, cloud_cover_max=cloud_cover_max)
 
-    tensor = _build_15ch_tensor_from_items(items, west, south, east, north)
+    # For model inference, we MUST have 64x64 shape
+    tensor = _build_15ch_tensor_from_items(items, west, south, east, north, out_shape=(64, 64))
 
     model, device = ModelSingleton.get_model()
     tensor = tensor.to(device)
@@ -227,10 +242,18 @@ def run_remote_inference_planetary_computer(
     with torch.no_grad():
         density_out, species_out = model(tensor)
 
-    density = float(torch.clamp(density_out.squeeze(), 0.0, 1.0).cpu())
+    density_raw = float(density_out.squeeze().cpu())
+    density_mode = getattr(model, "density_mode", "normalized")
+    density, trees_per_hectare = postprocess_density_output(density_raw, density_mode=density_mode)
     species_probs = species_out.squeeze().cpu().numpy()
 
-    result = _build_result(density, species_probs, species_threshold, filename="remote_location")
+    result = _build_result(
+        density,
+        species_probs,
+        species_threshold,
+        filename="remote_location",
+        trees_per_hectare_override=trees_per_hectare,
+    )
     result["remote_source"] = {
         "provider": "planetary_computer",
         "sentinel2_item_id": items.s2.id,
@@ -259,10 +282,11 @@ def fetch_remote_tensor_planetary_computer(
     end_date: str,
     radius_km: float = 0.1,
     cloud_cover_max: float = 40.0,
+    out_shape: Optional[Tuple[int, int]] = (64, 64)
 ) -> Tuple[torch.Tensor, Dict[str, Any]]:
     """
-    Fetch remote Sentinel-1/2 data and return a model-ready 15-channel tensor.
-    Useful for training pipelines that operate on AOI samples across any state/region.
+    Fetch remote Sentinel-1/2 data and return a multi-channel tensor.
+    Default shape is 64x64 for model inference, but can be customized (e.g. high-res for visualization).
     """
     west, south, east, north = _bbox_from_center_radius(lat, lon, radius_km)
     items = _search_planetary_computer_items(
@@ -272,7 +296,7 @@ def fetch_remote_tensor_planetary_computer(
         end_date,
         cloud_cover_max=cloud_cover_max,
     )
-    tensor = _build_15ch_tensor_from_items(items, west, south, east, north)
+    tensor = _build_15ch_tensor_from_items(items, west, south, east, north, out_shape=out_shape)
     metadata = {
         "provider": "planetary_computer",
         "sentinel2_item_id": items.s2.id,
@@ -347,16 +371,24 @@ def run_remote_inference_planetary_computer_grid(
                 lon=plon,
                 start_date=start_date,
                 end_date=end_date,
-                radius_km=max(0.05, radius_km / max(grid_size, 1)),
+                radius_km=0.1,  # Each sample is a standard 200m patch
                 cloud_cover_max=cloud_cover_max,
             )
             tensor = tensor.to(device)
             with torch.no_grad():
                 density_out, species_out = model(tensor)
 
-            density = float(torch.clamp(density_out.squeeze(), 0.0, 1.0).cpu())
+            density_raw = float(density_out.squeeze().cpu())
+            density_mode = getattr(model, "density_mode", "normalized")
+            density, trees_per_hectare = postprocess_density_output(density_raw, density_mode=density_mode)
             species_probs = species_out.squeeze().cpu().numpy()
-            result = _build_result(density, species_probs, species_threshold, filename=f"grid_{idx:03d}")
+            result = _build_result(
+                density,
+                species_probs,
+                species_threshold,
+                filename=f"grid_{idx:03d}",
+                trees_per_hectare_override=trees_per_hectare,
+            )
             result["remote_source"] = meta
             per_point.append(result)
         except Exception:

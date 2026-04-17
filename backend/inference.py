@@ -12,6 +12,30 @@ from typing import Dict, Any, Optional, List, Tuple
 from .model_loader import ModelSingleton, SPECIES_LABELS, INPUT_CHANNELS
 
 
+MAX_TPH_REFERENCE = float(os.getenv("MODEL_MAX_TPH_REFERENCE", "1000"))
+
+
+def postprocess_density_output(
+    density_raw: float,
+    density_mode: str = "normalized",
+    max_tph_reference: float = MAX_TPH_REFERENCE,
+) -> Tuple[float, float]:
+    """
+    Convert density head output into:
+    - normalized density (0..1-like, for backward-compatible display)
+    - trees_per_hectare (TPH)
+    """
+    mode = (density_mode or "normalized").strip().lower()
+    if mode == "tph":
+        tph = max(0.0, float(density_raw))
+        density = float(np.clip(tph / max(1e-6, max_tph_reference), 0.0, 1.0))
+        return density, tph
+
+    density = float(np.clip(float(density_raw), 0.0, 1.0))
+    tph = density * max_tph_reference
+    return density, tph
+
+
 def preprocess_tif(file_path: str, target_size: int = 64) -> torch.Tensor:
     """
     Read a single .tif file (15-band stacked) and preprocess into a model-ready tensor.
@@ -136,14 +160,14 @@ def run_inference(file_path: str, species_threshold: float = 0.5) -> Dict[str, A
         density_out, species_out = model(tensor)
 
     # Extract predictions
-    density = float(torch.clamp(density_out.squeeze(), 0.0, 1.0).cpu())
+    density_raw = float(density_out.squeeze().cpu())
+    density_mode = getattr(model, "density_mode", "normalized")
+    density, trees_per_hectare = postprocess_density_output(density_raw, density_mode=density_mode)
     species_probs = species_out.squeeze().cpu().numpy()
 
     # Compute tree count metrics
     patch_area_hectares = (200 * 200) / 10000  # 4 hectares
-    max_trees_per_hectare = 1000
-    estimated_trees = density * max_trees_per_hectare * patch_area_hectares
-    trees_per_hectare = density * max_trees_per_hectare
+    estimated_trees = trees_per_hectare * patch_area_hectares
     trees_per_sqkm = trees_per_hectare * 100  # 1 km² = 100 hectares
 
     # Species analysis
@@ -208,12 +232,17 @@ def run_inference_paired(
     with torch.no_grad():
         density_out, species_out = model(tensor)
 
-    density = float(torch.clamp(density_out.squeeze(), 0.0, 1.0).cpu())
+    density_raw = float(density_out.squeeze().cpu())
+    density_mode = getattr(model, "density_mode", "normalized")
+    density, trees_per_hectare = postprocess_density_output(density_raw, density_mode=density_mode)
     species_probs = species_out.squeeze().cpu().numpy()
 
     return _build_result(
-        density, species_probs, species_threshold,
-        filename=os.path.basename(s2_path)
+        density,
+        species_probs,
+        species_threshold,
+        filename=os.path.basename(s2_path),
+        trees_per_hectare_override=trees_per_hectare,
     )
 
 
@@ -221,13 +250,17 @@ def _build_result(
     density: float,
     species_probs: np.ndarray,
     species_threshold: float,
-    filename: str = ""
+    filename: str = "",
+    trees_per_hectare_override: Optional[float] = None,
 ) -> Dict[str, Any]:
     """Build a result dict from raw model outputs."""
     patch_area_hectares = (200 * 200) / 10000
-    max_trees_per_hectare = 1000
-    estimated_trees = density * max_trees_per_hectare * patch_area_hectares
-    trees_per_hectare = density * max_trees_per_hectare
+    trees_per_hectare = (
+        float(trees_per_hectare_override)
+        if trees_per_hectare_override is not None
+        else float(density) * MAX_TPH_REFERENCE
+    )
+    estimated_trees = trees_per_hectare * patch_area_hectares
     trees_per_sqkm = trees_per_hectare * 100
 
     species_distribution = []
@@ -361,12 +394,17 @@ def batch_inference(
 
         # Process each result in the batch
         for i in range(len(batch_filenames)):
-            density = float(torch.clamp(density_out[i].squeeze(), 0.0, 1.0).cpu())
+            density_raw = float(density_out[i].squeeze().cpu())
+            density_mode = getattr(model, "density_mode", "normalized")
+            density, trees_per_hectare = postprocess_density_output(density_raw, density_mode=density_mode)
             species_probs = species_out[i].cpu().numpy()
 
             result = _build_result(
-                density, species_probs, species_threshold,
-                filename=batch_filenames[i]
+                density,
+                species_probs,
+                species_threshold,
+                filename=batch_filenames[i],
+                trees_per_hectare_override=trees_per_hectare,
             )
             all_results.append(result)
 

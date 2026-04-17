@@ -132,8 +132,15 @@ class TreeSatMultiHeadModelV2(nn.Module):
     - Stronger regularized heads with BN + SiLU + dropout
     """
 
-    def __init__(self, in_channels=INPUT_CHANNELS, num_species=NUM_SPECIES):
+    def __init__(
+        self,
+        in_channels=INPUT_CHANNELS,
+        num_species=NUM_SPECIES,
+        density_mode: str = "normalized",
+    ):
         super().__init__()
+        self.density_mode = (density_mode or "normalized").strip().lower()
+        density_output_act = nn.Identity() if self.density_mode == "tph" else nn.Sigmoid()
         self.spectral_stem = SpectralStem(in_channels=in_channels, out_channels=32)
 
         self.backbone = resnet34(weights=None)
@@ -154,7 +161,7 @@ class TreeSatMultiHeadModelV2(nn.Module):
             nn.SiLU(inplace=True),
             nn.Dropout(0.2),
             nn.Linear(96, 1),
-            nn.Sigmoid(),
+            density_output_act,
         )
 
         self.species_head = nn.Sequential(
@@ -178,7 +185,12 @@ class TreeSatMultiHeadModelV2(nn.Module):
         return density, species
 
 
-def build_model(variant: str, in_channels: int, num_species: int) -> nn.Module:
+def build_model(
+    variant: str,
+    in_channels: int,
+    num_species: int,
+    density_mode: str = "normalized",
+) -> nn.Module:
     """
     Build requested model variant.
     Supported values:
@@ -187,7 +199,11 @@ def build_model(variant: str, in_channels: int, num_species: int) -> nn.Module:
     """
     key = (variant or "v1").strip().lower()
     if key in {"v2", "treesat_v2", "treesatmultiheadmodelv2"}:
-        return TreeSatMultiHeadModelV2(in_channels=in_channels, num_species=num_species)
+        return TreeSatMultiHeadModelV2(
+            in_channels=in_channels,
+            num_species=num_species,
+            density_mode=density_mode,
+        )
     return TreeSatMultiHeadModel(in_channels=in_channels, num_species=num_species)
 
 
@@ -244,11 +260,13 @@ class ModelSingleton:
         """Load trained model from checkpoint."""
         self._device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self._variant = os.getenv("MODEL_VARIANT", "v1")
+        density_mode = os.getenv("MODEL_DENSITY_MODE", "normalized").strip().lower()
         variant_key = (self._variant or "v1").strip().lower()
         self._model = build_model(
             variant=self._variant,
             in_channels=INPUT_CHANNELS,
             num_species=NUM_SPECIES,
+            density_mode=density_mode,
         )
 
         checkpoints_dir = os.path.join(os.path.dirname(__file__), "checkpoints")
@@ -293,6 +311,7 @@ class ModelSingleton:
         self._model.to(self._device)
         self._model.eval()
         print(f"[ModelLoader] Model variant: {self._variant}")
+        print(f"[ModelLoader] Density mode: {getattr(self._model, 'density_mode', 'normalized')}")
         print(f"[ModelLoader] Model loaded on {self._device}")
 
     @classmethod
