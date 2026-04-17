@@ -251,6 +251,24 @@ Params:
 
 This endpoint performs lightweight NDVI-based connected-component detection for crown candidates and returns object-level bounding boxes/centroids.
 
+For lat/lon-driven crown detection without a local file, first fetch a remote GeoTIFF patch:
+
+`POST /api/fetch-remote-geotiff`
+
+```json
+{
+  "lat": 38.7,
+  "lon": -79.9,
+  "start_date": "2024-06-01",
+  "end_date": "2024-08-31",
+  "radius_km": 0.2,
+  "provider": "planetary_computer",
+  "cloud_cover_max": 30
+}
+```
+
+This returns a 15-band GeoTIFF file (`image/tiff`) that can be sent directly to `/api/detect-crowns`.
+
 ### Train V2 (Generalized AOI / State-Agnostic)
 
 Use `train_v2.py` to fine-tune `TreeSatMultiHeadModelV2` and produce checkpoints.

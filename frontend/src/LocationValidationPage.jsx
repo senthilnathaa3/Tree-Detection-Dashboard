@@ -10,7 +10,7 @@ import {
   XAxis,
   YAxis,
 } from 'recharts';
-import { detectCrowns, validateLocation } from './services/api';
+import { detectCrowns, fetchRemoteGeoTiff, validateLocation } from './services/api';
 
 const FOREST_PRESET = {
   lat: 38.7,
@@ -90,12 +90,17 @@ export default function LocationValidationPage() {
   const [error, setError] = useState('');
   const [result, setResult] = useState(null);
   const [showJson, setShowJson] = useState(false);
+  const [isConfigExpanded, setIsConfigExpanded] = useState(true);
   const [crownFile, setCrownFile] = useState(null);
   const [crownThreshold, setCrownThreshold] = useState(0.45);
   const [crownMinArea, setCrownMinArea] = useState(12);
+  const [crownFetchRadiusKm, setCrownFetchRadiusKm] = useState(0.2);
   const [crownLoading, setCrownLoading] = useState(false);
+  const [crownFetchLoading, setCrownFetchLoading] = useState(false);
   const [crownError, setCrownError] = useState('');
   const [crownResult, setCrownResult] = useState(null);
+  const [isDetectionExpanded, setIsDetectionExpanded] = useState(false);
+  const [shouldAlignWithModel, setShouldAlignWithModel] = useState(true);
 
   const isFIA = form.validation_source === 'fia';
 
@@ -144,6 +149,7 @@ export default function LocationValidationPage() {
     try {
       const data = await validateLocation(payload);
       setResult(data);
+      setIsConfigExpanded(false);
     } catch (err) {
       setError(err.message || 'Location validation failed');
     } finally {
@@ -160,13 +166,55 @@ export default function LocationValidationPage() {
     setCrownLoading(true);
     setCrownError('');
     setCrownResult(null);
+
+    // Get target count from model result if available and desired
+    let targetCount = null;
+    if (shouldAlignWithModel && result) {
+      // Use calibrated TPH if available, otherwise raw model TPH
+      const tph = insights?.calibratedTPH ?? insights?.modelTPH;
+      if (tph) {
+          // Calculate area in hectares for the crown TIFF
+          // Area of circle = pi * r^2. 1 km^2 = 100 hectares.
+          const radiusKm = Number(crownFetchRadiusKm);
+          const areaHa = (Math.PI * Math.pow(radiusKm, 2)) * 100;
+          targetCount = tph * areaHa;
+      }
+    }
+
     try {
-      const res = await detectCrowns(crownFile, Number(crownThreshold), Number(crownMinArea));
+      const res = await detectCrowns(
+        crownFile, 
+        Number(crownThreshold), 
+        Number(crownMinArea),
+        targetCount
+      );
       setCrownResult(res);
     } catch (err) {
       setCrownError(err.message || 'Crown detection failed');
     } finally {
       setCrownLoading(false);
+    }
+  };
+
+  const autoFetchCrownTiff = async () => {
+    setCrownError('');
+    setCrownResult(null);
+    setCrownFetchLoading(true);
+    try {
+      const file = await fetchRemoteGeoTiff({
+        lat: Number(form.lat),
+        lon: Number(form.lon),
+        start_date: form.start_date,
+        end_date: form.end_date,
+        radius_km: Number(crownFetchRadiusKm),
+        provider: form.provider,
+        cloud_cover_max: Number(form.cloud_cover_max),
+      });
+      setCrownFile(file);
+    } catch (err) {
+      setCrownError(err.message || 'Remote GeoTIFF fetch failed');
+    } finally {
+      setCrownFetchLoading(false);
     }
   };
 
@@ -222,114 +270,139 @@ export default function LocationValidationPage() {
       <header style={styles.header}>
         <div>
           <h1 style={styles.h1}>Lat/Lon Validation</h1>
-          <p style={styles.sub}>Remote inference + FIA/ESA comparison for pitch-ready benchmarking</p>
+          <p style={styles.sub}>Remote inference + FIA/ESA benchmark comparison</p>
         </div>
-        <a href="/" style={styles.linkBtn}>Open Dashboard</a>
+        <div style={{ display: 'flex', gap: 12 }}>
+          <button 
+            style={styles.linkBtn} 
+            onClick={() => setIsConfigExpanded(!isConfigExpanded)}
+          >
+            {isConfigExpanded ? 'Hide Parameters' : 'Edit Configuration'}
+          </button>
+          <a href="/" style={{ ...styles.linkBtn, background: 'var(--green-600)', borderColor: 'var(--green-500)', color: 'white' }}>
+            Open Dashboard
+          </a>
+        </div>
       </header>
 
-      <form onSubmit={onSubmit} style={styles.formCard}>
-        <div style={styles.grid3}>
-          <NumberInput label="Latitude" value={form.lat} onChange={(v) => setField('lat', v)} step="0.0001" min={-90} max={90} />
-          <NumberInput label="Longitude" value={form.lon} onChange={(v) => setField('lon', v)} step="0.0001" min={-180} max={180} />
-          <NumberInput label="Radius (km)" value={form.radius_km} onChange={(v) => setField('radius_km', v)} step="0.1" min={0.1} />
-        </div>
-
-        <div style={styles.grid3}>
-          <DateInput label="Start Date" value={form.start_date} onChange={(v) => setField('start_date', v)} />
-          <DateInput label="End Date" value={form.end_date} onChange={(v) => setField('end_date', v)} />
-          <NumberInput label="Cloud Cover Max (%)" value={form.cloud_cover_max} onChange={(v) => setField('cloud_cover_max', v)} step="1" min={0} max={100} />
-        </div>
-
-        <div style={styles.grid3}>
-          <NumberInput label="Species Threshold" value={form.threshold} onChange={(v) => setField('threshold', v)} step="0.01" min={0} max={1} />
-
-          <label style={styles.field}>
-            <span style={styles.label}>Provider</span>
-            <select style={styles.input} value={form.provider} onChange={(e) => setField('provider', e.target.value)}>
-              <option value="planetary_computer">Planetary Computer</option>
-            </select>
-          </label>
-
-          <label style={styles.field}>
-            <span style={styles.label}>Validation Source</span>
-            <select
-              style={styles.input}
-              value={form.validation_source}
-              onChange={(e) => setField('validation_source', e.target.value)}
-            >
-              <option value="fia">FIA</option>
-              <option value="esa_worldcover">ESA WorldCover</option>
-            </select>
-          </label>
-        </div>
-
-        <div style={styles.grid2}>
-          <NumberInput
-            label="Sample Grid Size (1/3/5)"
-            value={form.sample_grid_size}
-            onChange={(v) => setField('sample_grid_size', v)}
-            step="1"
-            min={1}
-          />
-          <NumberInput
-            label="Calibration Slope (optional)"
-            value={form.calibration_slope}
-            onChange={(v) => setField('calibration_slope', v)}
-            step="0.000001"
-          />
-          <NumberInput
-            label="Calibration Intercept (optional)"
-            value={form.calibration_intercept}
-            onChange={(v) => setField('calibration_intercept', v)}
-            step="0.000001"
-          />
-        </div>
-        <div style={styles.grid2}>
-          <TextInput
-            label="Calibration Profile Path (optional)"
-            value={form.calibration_profile_path}
-            onChange={(v) => setField('calibration_profile_path', v)}
-            placeholder="/abs/path/regional_calibration.json"
-          />
-          <TextInput
-            label="Calibration Region (optional)"
-            value={form.calibration_region}
-            onChange={(v) => setField('calibration_region', v)}
-            placeholder="e.g., appalachia_wv"
-          />
-        </div>
-
-        {isFIA ? (
+      <div style={styles.formCard}>
+        {isConfigExpanded && (
           <>
-            <TextInput
-              label="FIA CSV Path"
-              value={form.fia_csv_path}
-              onChange={(v) => setField('fia_csv_path', v)}
-              placeholder="/abs/path/to/fia.csv"
-            />
-            <div style={styles.grid2}>
-              <NumberInput label="Year Start (optional)" value={form.year_start} onChange={(v) => setField('year_start', v)} step="1" />
-              <NumberInput label="Year End (optional)" value={form.year_end} onChange={(v) => setField('year_end', v)} step="1" />
+            <div style={styles.configHeader}>
+              <div style={styles.h2}>Validation Parameters</div>
+              <button 
+                type="button" 
+                style={styles.secondaryBtn} 
+                onClick={() => setForm(FOREST_PRESET)}
+                disabled={loading}
+              >
+                Reset Preset
+              </button>
             </div>
-          </>
-        ) : (
-          <TextInput
-            label="WorldCover Raster Path"
-            value={form.worldcover_path}
-            onChange={(v) => setField('worldcover_path', v)}
-            placeholder="/abs/path/to/worldcover.tif"
-          />
-        )}
+            <form onSubmit={onSubmit} style={styles.formContent}>
+              <div style={styles.grid3}>
+                <NumberInput label="Latitude" value={form.lat} onChange={(v) => setField('lat', v)} step="0.0001" min={-90} max={90} />
+                <NumberInput label="Longitude" value={form.lon} onChange={(v) => setField('lon', v)} step="0.0001" min={-180} max={180} />
+                <NumberInput label="Radius (km)" value={form.radius_km} onChange={(v) => setField('radius_km', v)} step="0.1" min={0.1} />
+              </div>
 
-        <div style={styles.actions}>
-          <button type="button" style={styles.secondaryBtn} onClick={() => setForm(FOREST_PRESET)} disabled={loading}>
-            Reset Preset
-          </button>
-          <button type="submit" style={styles.primaryBtn} disabled={loading}>
-            {loading ? 'Running...' : 'Run Validation'}
-          </button>
-        </div>
-      </form>
+              <div style={styles.grid3}>
+                <DateInput label="Start Date" value={form.start_date} onChange={(v) => setField('start_date', v)} />
+                <DateInput label="End Date" value={form.end_date} onChange={(v) => setField('end_date', v)} />
+                <NumberInput label="Cloud Cover Max (%)" value={form.cloud_cover_max} onChange={(v) => setField('cloud_cover_max', v)} step="1" min={0} max={100} />
+              </div>
+
+              <div style={styles.grid3}>
+                <NumberInput label="Species Threshold" value={form.threshold} onChange={(v) => setField('threshold', v)} step="0.01" min={0} max={1} />
+
+                <label style={styles.field}>
+                  <span style={styles.label}>Provider</span>
+                  <select style={styles.input} value={form.provider} onChange={(e) => setField('provider', e.target.value)}>
+                    <option value="planetary_computer">Planetary Computer</option>
+                  </select>
+                </label>
+
+                <label style={styles.field}>
+                  <span style={styles.label}>Validation Source</span>
+                  <select
+                    style={styles.input}
+                    value={form.validation_source}
+                    onChange={(e) => setField('validation_source', e.target.value)}
+                  >
+                    <option value="fia">FIA</option>
+                    <option value="esa_worldcover">ESA WorldCover</option>
+                  </select>
+                </label>
+              </div>
+
+              <div style={styles.grid2}>
+                <NumberInput
+                  label="Sample Grid Size (1/3/5)"
+                  value={form.sample_grid_size}
+                  onChange={(v) => setField('sample_grid_size', v)}
+                  step="1"
+                  min={1}
+                />
+                <NumberInput
+                  label="Calibration Slope"
+                  value={form.calibration_slope}
+                  onChange={(v) => setField('calibration_slope', v)}
+                  step="0.000001"
+                />
+                <NumberInput
+                  label="Calibration Intercept"
+                  value={form.calibration_intercept}
+                  onChange={(v) => setField('calibration_intercept', v)}
+                  step="0.000001"
+                />
+              </div>
+              
+              <div style={styles.grid2}>
+                <TextInput
+                  label="Calibration Profile Path"
+                  value={form.calibration_profile_path}
+                  onChange={(v) => setField('calibration_profile_path', v)}
+                  placeholder="/abs/path/regional_calibration.json"
+                />
+                <TextInput
+                  label="Calibration Region"
+                  value={form.calibration_region}
+                  onChange={(v) => setField('calibration_region', v)}
+                  placeholder="e.g., appalachia_wv"
+                />
+              </div>
+
+              {isFIA ? (
+                <>
+                  <TextInput
+                    label="FIA CSV Path"
+                    value={form.fia_csv_path}
+                    onChange={(v) => setField('fia_csv_path', v)}
+                    placeholder="/abs/path/to/fia.csv"
+                  />
+                  <div style={styles.grid2}>
+                    <NumberInput label="Year Start" value={form.year_start} onChange={(v) => setField('year_start', v)} step="1" />
+                    <NumberInput label="Year End" value={form.year_end} onChange={(v) => setField('year_end', v)} step="1" />
+                  </div>
+                </>
+              ) : (
+                <TextInput
+                  label="WorldCover Raster Path"
+                  value={form.worldcover_path}
+                  onChange={(v) => setField('worldcover_path', v)}
+                  placeholder="/abs/path/to/worldcover.tif"
+                />
+              )}
+
+              <div style={styles.actions}>
+                <button type="submit" style={styles.primaryBtn} disabled={loading}>
+                  {loading ? 'Processing Validation...' : 'Run Benchmark'}
+                </button>
+              </div>
+            </form>
+          </>
+        )}
+      </div>
 
       {error ? <div style={styles.error}>{error}</div> : null}
 
@@ -373,11 +446,12 @@ export default function LocationValidationPage() {
                 <ResponsiveContainer width="100%" height={260}>
                   <BarChart data={insights.tphChartData} margin={{ top: 12, right: 18, left: 0, bottom: 12 }}>
                     <CartesianGrid strokeDasharray="3 3" stroke="rgba(148,163,184,0.25)" />
-                    <XAxis dataKey="metric" tick={{ fill: '#cbd5e1', fontSize: 12 }} />
-                    <YAxis tick={{ fill: '#cbd5e1', fontSize: 12 }} />
+                    <XAxis dataKey="metric" tick={{ fill: 'var(--text-muted)', fontSize: 11, fontWeight: 500 }} axisLine={{ stroke: 'var(--border-color)' }} tickLine={false} />
+                    <YAxis tick={{ fill: 'var(--text-muted)', fontSize: 11, fontWeight: 500 }} axisLine={{ stroke: 'var(--border-color)' }} tickLine={false} />
                     <Tooltip
-                      contentStyle={{ backgroundColor: '#0b1220', border: '1px solid #334155', borderRadius: 8 }}
-                      labelStyle={{ color: '#e2e8f0' }}
+                      contentStyle={{ backgroundColor: 'var(--bg-elevated)', border: '1px solid var(--border-color)', borderRadius: 10, boxShadow: 'var(--shadow-lg)' }}
+                      labelStyle={{ color: 'var(--text-primary)', fontWeight: 600, marginBottom: 4 }}
+                      itemStyle={{ fontSize: '0.85rem' }}
                     />
                     <Legend />
                     <Bar dataKey="value" name="TPH" radius={[8, 8, 0, 0]}>
@@ -394,11 +468,12 @@ export default function LocationValidationPage() {
                 <ResponsiveContainer width="100%" height={260}>
                   <BarChart data={insights.treeCountChartData} margin={{ top: 12, right: 18, left: 0, bottom: 12 }}>
                     <CartesianGrid strokeDasharray="3 3" stroke="rgba(148,163,184,0.25)" />
-                    <XAxis dataKey="metric" tick={{ fill: '#cbd5e1', fontSize: 12 }} />
-                    <YAxis tick={{ fill: '#cbd5e1', fontSize: 12 }} />
+                    <XAxis dataKey="metric" tick={{ fill: 'var(--text-muted)', fontSize: 11, fontWeight: 500 }} axisLine={{ stroke: 'var(--border-color)' }} tickLine={false} />
+                    <YAxis tick={{ fill: 'var(--text-muted)', fontSize: 11, fontWeight: 500 }} axisLine={{ stroke: 'var(--border-color)' }} tickLine={false} />
                     <Tooltip
-                      contentStyle={{ backgroundColor: '#0b1220', border: '1px solid #334155', borderRadius: 8 }}
-                      labelStyle={{ color: '#e2e8f0' }}
+                      contentStyle={{ backgroundColor: 'var(--bg-elevated)', border: '1px solid var(--border-color)', borderRadius: 10, boxShadow: 'var(--shadow-lg)' }}
+                      labelStyle={{ color: 'var(--text-primary)', fontWeight: 600, marginBottom: 4 }}
+                      itemStyle={{ fontSize: '0.85rem' }}
                     />
                     <Bar dataKey="value" name="Tree Count" radius={[8, 8, 0, 0]}>
                       {insights.treeCountChartData.map((entry) => (
@@ -436,22 +511,61 @@ export default function LocationValidationPage() {
         </>
       ) : null}
 
-      <section style={styles.resultCard}>
-        <h2 style={styles.h2}>Object Detection: Crown Candidates</h2>
-        <p style={styles.subtleLine}>
-          NDVI + connected-components baseline for object-level crown candidate detection.
-        </p>
+      <section style={{ ...styles.resultCard, marginTop: 40, background: 'rgba(255,255,255,0.01)' }}>
+        <div style={styles.rowBetween}>
+          <div>
+            <h2 style={{ ...styles.h2, margin: 0 }}>Developer Tool: Object Detection</h2>
+            <p style={styles.subtleLine}>NDVI + connected-components baseline for crown candidate detection</p>
+          </div>
+          <button 
+            style={styles.secondaryBtn} 
+            type="button" 
+            onClick={() => setIsDetectionExpanded(!isDetectionExpanded)}
+          >
+            {isDetectionExpanded ? 'Hide Detection Tool' : 'Show Detection Tool'}
+          </button>
+        </div>
 
-        <form onSubmit={runCrownDetection} style={styles.crownForm}>
-          <label style={styles.field}>
-            <span style={styles.label}>GeoTIFF File</span>
-            <input
-              style={styles.fileInput}
-              type="file"
-              accept=".tif,.tiff"
-              onChange={(e) => setCrownFile(e.target.files?.[0] || null)}
-            />
-          </label>
+        {isDetectionExpanded && (
+          <div style={{ marginTop: 24, paddingTop: 24, borderTop: '1px solid var(--border-color)' }}>
+            <form onSubmit={runCrownDetection} style={styles.crownForm}>
+              <div style={styles.fetchBox}>
+                <div style={styles.fetchRow}>
+                  <NumberInput
+                    label="Fetch Radius (km)"
+                    value={crownFetchRadiusKm}
+                    onChange={(v) => setCrownFetchRadiusKm(v)}
+                    step="0.05"
+                    min={0.05}
+                  />
+                  <div style={{ display: 'flex', alignItems: 'end' }}>
+                    <button
+                      type="button"
+                      style={styles.primaryBtn}
+                      onClick={autoFetchCrownTiff}
+                      disabled={crownFetchLoading || crownLoading}
+                    >
+                      {crownFetchLoading ? 'Fetching GeoTIFF...' : 'Auto-Fetch GeoTIFF (Lat/Lon)'}
+                    </button>
+                  </div>
+                </div>
+                <div style={styles.smallNote}>
+                  Uses current latitude/longitude, date range, provider, and cloud-cover settings from above.
+                </div>
+              </div>
+
+              <label style={styles.field}>
+                <span style={styles.label}>GeoTIFF File</span>
+                <input
+                  style={styles.fileInput}
+                  type="file"
+                  accept=".tif,.tiff"
+                  onChange={(e) => setCrownFile(e.target.files?.[0] || null)}
+                />
+                <span style={styles.fileName}>
+                  {crownFile ? `Selected: ${crownFile.name}` : 'No file selected yet'}
+                </span>
+              </label>
 
           <div style={styles.grid3}>
             <NumberInput
@@ -469,70 +583,81 @@ export default function LocationValidationPage() {
               step="1"
               min={1}
             />
-            <div style={{ display: 'flex', alignItems: 'end' }}>
-              <button type="submit" style={styles.primaryBtn} disabled={crownLoading}>
-                {crownLoading ? 'Detecting...' : 'Run Crown Detection'}
-              </button>
-            </div>
+            <label style={{ ...styles.field, cursor: 'pointer', display: 'flex', flexDirection: 'row', alignItems: 'center', gap: 8 }}>
+              <input
+                type="checkbox"
+                checked={shouldAlignWithModel}
+                onChange={(e) => setShouldAlignWithModel(e.target.checked)}
+                style={{ width: 18, height: 18 }}
+              />
+              <span style={{ ...styles.label, textTransform: 'none', fontSize: '0.85rem' }}>Align Count with Model</span>
+            </label>
+          </div>
+          <div style={{ display: 'flex', justifyContent: 'flex-end', marginTop: 12 }}>
+            <button type="submit" style={{ ...styles.primaryBtn, background: 'var(--blue-600)' }} disabled={crownLoading || crownFetchLoading}>
+              {crownLoading ? 'Detecting...' : 'Run Crown Detection'}
+            </button>
           </div>
         </form>
 
-        {crownError ? <div style={styles.errorInline}>{crownError}</div> : null}
+            {crownError ? <div style={styles.errorInline}>{crownError}</div> : null}
 
-        {crownResult ? (
-          <>
-            <div style={styles.kpiGrid}>
-              <MetricCard
-                title="Detected Candidates"
-                value={fmtNum(crownResult.candidate_count, 0)}
-                subtitle="Object-level crown candidates"
-                tone="green"
-              />
-              <MetricCard
-                title="NDVI Threshold"
-                value={fmtNum(crownResult.ndvi_threshold, 2)}
-                subtitle="Detection sensitivity"
-                tone="sky"
-              />
-              <MetricCard
-                title="Min Area"
-                value={`${fmtNum(crownResult.min_area_px, 0)} px`}
-                subtitle="Noise filtering"
-                tone="purple"
-              />
-            </div>
+            {crownResult ? (
+              <>
+                <div style={styles.kpiGrid}>
+                  <MetricCard
+                    title="Detected Candidates"
+                    value={fmtNum(crownResult.candidate_count, 0)}
+                    subtitle="Object-level crown candidates"
+                    tone="green"
+                  />
+                  <MetricCard
+                    title="NDVI Threshold"
+                    value={fmtNum(crownResult.ndvi_threshold, 2)}
+                    subtitle="Detection sensitivity"
+                    tone="sky"
+                  />
+                  <MetricCard
+                    title="Min Area"
+                    value={`${fmtNum(crownResult.min_area_px, 0)} px`}
+                    subtitle="Noise filtering"
+                    tone="purple"
+                  />
+                </div>
 
-            <div style={{ marginTop: 12 }}>
-              <div style={styles.chartTitle}>Top Crown Candidates</div>
-              <div style={styles.tableWrap}>
-                <table style={styles.table}>
-                  <thead>
-                    <tr>
-                      <th>#</th>
-                      <th>Score</th>
-                      <th>Area(px)</th>
-                      <th>Centroid(px)</th>
-                      <th>BBox(px)</th>
-                    </tr>
-                  </thead>
-                  <tbody>
-                    {(crownResult.detections || []).slice(0, 20).map((d, i) => (
-                      <tr key={`${i}-${d.score}`}>
-                        <td>{i + 1}</td>
-                        <td>{fmtNum(d.score, 3)}</td>
-                        <td>{fmtNum(d.area_px, 0)}</td>
-                        <td>{fmtNum(d.centroid_px?.x, 1)}, {fmtNum(d.centroid_px?.y, 1)}</td>
-                        <td>
-                          {d.bbox_px?.xmin},{d.bbox_px?.ymin} {' -> '} {d.bbox_px?.xmax},{d.bbox_px?.ymax}
-                        </td>
-                      </tr>
-                    ))}
-                  </tbody>
-                </table>
-              </div>
-            </div>
-          </>
-        ) : null}
+                <div style={{ marginTop: 24 }}>
+                  <div style={styles.chartTitle}>Top Crown Candidates</div>
+                  <div style={styles.tableWrap}>
+                    <table style={styles.table}>
+                      <thead style={{ background: 'rgba(255,255,255,0.03)' }}>
+                        <tr>
+                          <th style={{ padding: '12px 14px', textAlign: 'left' }}>#</th>
+                          <th style={{ padding: '12px 14px', textAlign: 'left' }}>Score</th>
+                          <th style={{ padding: '12px 14px', textAlign: 'left' }}>Area(px)</th>
+                          <th style={{ padding: '12px 14px', textAlign: 'left' }}>Centroid(px)</th>
+                          <th style={{ padding: '12px 14px', textAlign: 'left' }}>BBox(px)</th>
+                        </tr>
+                      </thead>
+                      <tbody>
+                        {(crownResult.detections || []).slice(0, 20).map((d, i) => (
+                          <tr key={`${i}-${d.score}`} style={{ borderTop: '1px solid var(--border-color)' }}>
+                            <td style={{ padding: '12px 14px' }}>{i + 1}</td>
+                            <td style={{ padding: '12px 14px' }}>{fmtNum(d.score, 3)}</td>
+                            <td style={{ padding: '12px 14px' }}>{fmtNum(d.area_px, 0)}</td>
+                            <td style={{ padding: '12px 14px' }}>{fmtNum(d.centroid_px?.x, 1)}, {fmtNum(d.centroid_px?.y, 1)}</td>
+                            <td style={{ padding: '12px 14px' }}>
+                              {d.bbox_px?.xmin},{d.bbox_px?.ymin} {' -> '} {d.bbox_px?.xmax},{d.bbox_px?.ymax}
+                            </td>
+                          </tr>
+                        ))}
+                      </tbody>
+                    </table>
+                  </div>
+                </div>
+              </>
+            ) : null}
+          </div>
+        )}
       </section>
     </div>
   );
@@ -540,14 +665,15 @@ export default function LocationValidationPage() {
 
 function MetricCard({ title, value, subtitle, tone }) {
   const tones = {
-    blue: { border: 'rgba(59,130,246,0.4)', bg: 'rgba(59,130,246,0.12)' },
-    purple: { border: 'rgba(167,139,250,0.45)', bg: 'rgba(167,139,250,0.12)' },
-    green: { border: 'rgba(34,197,94,0.45)', bg: 'rgba(34,197,94,0.12)' },
-    sky: { border: 'rgba(14,165,233,0.45)', bg: 'rgba(14,165,233,0.12)' },
+    blue: '#3b82f6',
+    purple: '#a78bfa',
+    green: '#10b981',
+    sky: '#0ea5e9',
   };
-  const t = tones[tone] || tones.blue;
+  const color = tones[tone] || tones.blue;
   return (
-    <div style={{ ...styles.metricCard, borderColor: t.border, background: t.bg }}>
+    <div style={styles.metricCard}>
+      <div style={{ ...styles.metricAccent, background: color }} />
       <div style={styles.metricTitle}>{title}</div>
       <div style={styles.metricValue}>{value}</div>
       <div style={styles.metricSub}>{subtitle}</div>
@@ -567,184 +693,245 @@ function SummaryRow({ label, value }) {
 const styles = {
   page: {
     minHeight: '100vh',
-    background: 'linear-gradient(180deg, #04151f 0%, #0d1b2a 100%)',
-    color: '#e2e8f0',
-    padding: '24px',
-    fontFamily: "'JetBrains Mono', monospace",
+    background: 'var(--bg-primary)',
+    color: 'var(--text-primary)',
+    padding: '32px 24px',
+    fontFamily: 'var(--font-sans)',
   },
   header: {
-    maxWidth: 1260,
-    margin: '0 auto 16px',
+    maxWidth: 1200,
+    margin: '0 auto 24px',
     display: 'flex',
     justifyContent: 'space-between',
-    alignItems: 'flex-start',
+    alignItems: 'center',
     gap: 16,
   },
-  h1: { margin: 0, fontSize: '1.4rem' },
-  h2: { margin: '0 0 12px 0', fontSize: '1.05rem' },
-  sub: { margin: '8px 0 0 0', color: '#94a3b8', fontSize: '0.9rem' },
+  h1: { margin: 0, fontSize: '1.6rem', fontWeight: 700, letterSpacing: '-0.025em' },
+  h2: { margin: '0 0 16px 0', fontSize: '1.1rem', fontWeight: 600, color: 'var(--text-primary)' },
+  sub: { margin: '4px 0 0 0', color: 'var(--text-muted)', fontSize: '0.9rem' },
   linkBtn: {
-    color: '#0f172a',
-    background: '#34d399',
+    color: 'var(--text-primary)',
+    background: 'var(--bg-elevated)',
+    border: '1px solid var(--border-color)',
     textDecoration: 'none',
-    fontWeight: 700,
-    padding: '10px 14px',
-    borderRadius: 10,
+    fontWeight: 600,
+    padding: '8px 16px',
+    borderRadius: 8,
     fontSize: '0.85rem',
+    transition: 'all 0.2s ease',
+  },
+  configHeader: {
+    display: 'flex',
+    justifyContent: 'space-between',
+    alignItems: 'center',
+    padding: '12px 16px',
+    background: 'var(--bg-elevated)',
+    borderRadius: '12px 12px 0 0',
+    borderBottom: '1px solid var(--border-color)',
   },
   formCard: {
-    maxWidth: 1260,
+    maxWidth: 1200,
     margin: '0 auto',
-    background: 'rgba(15, 23, 42, 0.72)',
-    border: '1px solid rgba(148, 163, 184, 0.2)',
-    borderRadius: 14,
-    padding: 16,
-    display: 'grid',
-    gap: 12,
+    background: 'var(--bg-card)',
+    border: '1px solid var(--border-color)',
+    borderRadius: 12,
+    overflow: 'hidden',
   },
-  grid2: { display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(260px, 1fr))', gap: 12 },
-  grid3: { display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(220px, 1fr))', gap: 12 },
+  formContent: {
+    padding: 20,
+    display: 'grid',
+    gap: 16,
+  },
+  grid2: { display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(280px, 1fr))', gap: 16 },
+  grid3: { display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(240px, 1fr))', gap: 16 },
   field: { display: 'grid', gap: 6 },
-  label: { color: '#94a3b8', fontSize: '0.8rem' },
+  label: { color: 'var(--text-secondary)', fontSize: '0.75rem', fontWeight: 600, textTransform: 'uppercase', letterSpacing: '0.05em' },
   input: {
-    background: '#0f172a',
-    color: '#e2e8f0',
-    border: '1px solid #334155',
-    borderRadius: 10,
+    background: 'var(--bg-input)',
+    color: 'var(--text-primary)',
+    border: '1px solid var(--border-color)',
+    borderRadius: 8,
     padding: '10px 12px',
     outline: 'none',
-    fontFamily: "'JetBrains Mono', monospace",
+    fontFamily: 'var(--font-sans)',
+    fontSize: '0.9rem',
+    transition: 'border-color 0.2s ease',
   },
-  actions: { display: 'flex', justifyContent: 'flex-end', gap: 10, marginTop: 6 },
+  actions: { 
+    display: 'flex', 
+    justifyContent: 'flex-end', 
+    gap: 12, 
+    marginTop: 8,
+    padding: '16px 20px',
+    background: 'rgba(255,255,255,0.02)',
+    borderTop: '1px solid var(--border-color)',
+  },
   secondaryBtn: {
     background: 'transparent',
-    color: '#cbd5e1',
-    border: '1px solid #475569',
-    borderRadius: 10,
-    padding: '10px 12px',
+    color: 'var(--text-secondary)',
+    border: '1px solid var(--border-color)',
+    borderRadius: 8,
+    padding: '8px 16px',
     cursor: 'pointer',
-    fontFamily: "'JetBrains Mono', monospace",
+    fontFamily: 'var(--font-sans)',
+    fontWeight: 500,
+    fontSize: '0.85rem',
   },
   primaryBtn: {
-    background: '#10b981',
-    color: '#06231b',
+    background: 'var(--green-600)',
+    color: 'white',
     border: 'none',
-    borderRadius: 10,
-    padding: '10px 14px',
+    borderRadius: 8,
+    padding: '8px 20px',
     cursor: 'pointer',
-    fontWeight: 700,
-    fontFamily: "'JetBrains Mono', monospace",
+    fontWeight: 600,
+    fontFamily: 'var(--font-sans)',
+    fontSize: '0.85rem',
+    boxShadow: '0 1px 2px rgba(0,0,0,0.1)',
   },
   error: {
-    maxWidth: 1260,
-    margin: '14px auto 0',
-    borderRadius: 10,
-    border: '1px solid rgba(244,63,94,0.45)',
-    background: 'rgba(244,63,94,0.12)',
-    color: '#fecdd3',
+    maxWidth: 1200,
+    margin: '16px auto 0',
+    borderRadius: 12,
+    border: '1px solid rgba(244,63,94,0.3)',
+    background: 'rgba(244,63,94,0.05)',
+    color: '#fca5a5',
     padding: 12,
     fontSize: '0.85rem',
   },
   resultCard: {
-    maxWidth: 1260,
-    margin: '14px auto 0',
-    background: 'rgba(15, 23, 42, 0.72)',
-    border: '1px solid rgba(148, 163, 184, 0.2)',
-    borderRadius: 14,
-    padding: 16,
+    maxWidth: 1200,
+    margin: '24px auto 0',
+    background: 'var(--bg-card)',
+    border: '1px solid var(--border-color)',
+    borderRadius: 12,
+    padding: 24,
   },
   kpiGrid: {
     display: 'grid',
-    gridTemplateColumns: 'repeat(auto-fit, minmax(220px, 1fr))',
-    gap: 12,
+    gridTemplateColumns: 'repeat(auto-fit, minmax(240px, 1fr))',
+    gap: 16,
   },
   metricCard: {
-    border: '1px solid',
+    background: 'var(--bg-elevated)',
+    border: '1px solid var(--border-color)',
     borderRadius: 12,
-    padding: 12,
+    padding: 20,
+    position: 'relative',
+    overflow: 'hidden',
   },
-  metricTitle: { color: '#cbd5e1', fontSize: '0.75rem', marginBottom: 6 },
-  metricValue: { color: '#f8fafc', fontSize: '1.25rem', fontWeight: 700 },
-  metricSub: { color: '#94a3b8', fontSize: '0.7rem', marginTop: 4 },
+  metricAccent: {
+    position: 'absolute',
+    left: 0,
+    top: 0,
+    bottom: 0,
+    width: 4,
+  },
+  metricTitle: { color: 'var(--text-muted)', fontSize: '0.7rem', fontWeight: 600, textTransform: 'uppercase', letterSpacing: '0.05em', marginBottom: 8 },
+  metricValue: { color: 'var(--text-primary)', fontSize: '1.75rem', fontWeight: 700, letterSpacing: '-0.025em' },
+  metricSub: { color: 'var(--text-muted)', fontSize: '0.75rem', marginTop: 4 },
   chartGrid: {
     display: 'grid',
-    gridTemplateColumns: 'repeat(auto-fit, minmax(420px, 1fr))',
-    gap: 12,
+    gridTemplateColumns: 'repeat(auto-fit, minmax(480px, 1fr))',
+    gap: 20,
+    marginTop: 24,
   },
   chartBox: {
-    border: '1px solid rgba(148,163,184,0.22)',
+    border: '1px solid var(--border-color)',
     borderRadius: 12,
-    padding: 10,
-    background: 'rgba(2,6,23,0.45)',
+    padding: 20,
+    background: 'rgba(255,255,255,0.01)',
   },
-  chartTitle: { color: '#e2e8f0', fontSize: '0.85rem', marginBottom: 6, fontWeight: 600 },
-  smallNote: { color: '#94a3b8', fontSize: '0.7rem', marginTop: 8 },
+  chartTitle: { color: 'var(--text-primary)', fontSize: '0.95rem', marginBottom: 20, fontWeight: 600 },
+  smallNote: { color: 'var(--text-muted)', fontSize: '0.75rem', marginTop: 12, fontStyle: 'italic' },
   summaryGrid: {
     display: 'grid',
     gridTemplateColumns: 'repeat(auto-fit, minmax(280px, 1fr))',
-    gap: 8,
+    gap: 12,
   },
   summaryRow: {
     display: 'flex',
     justifyContent: 'space-between',
+    alignItems: 'center',
     gap: 8,
-    border: '1px solid rgba(148,163,184,0.2)',
-    borderRadius: 10,
-    padding: '8px 10px',
-    background: 'rgba(2,6,23,0.35)',
+    border: '1px solid var(--border-color)',
+    borderRadius: 8,
+    padding: '10px 14px',
+    background: 'rgba(255,255,255,0.01)',
   },
-  summaryLabel: { color: '#94a3b8', fontSize: '0.78rem' },
-  summaryValue: { color: '#e2e8f0', fontSize: '0.78rem', fontWeight: 600 },
-  rowBetween: { display: 'flex', justifyContent: 'space-between', alignItems: 'center' },
+  summaryLabel: { color: 'var(--text-muted)', fontSize: '0.8rem' },
+  summaryValue: { color: 'var(--text-primary)', fontSize: '0.85rem', fontWeight: 600 },
+  rowBetween: { display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 16 },
   pre: {
     margin: 0,
     maxHeight: '60vh',
     overflow: 'auto',
-    fontSize: '0.78rem',
-    lineHeight: 1.45,
-    color: '#cbd5e1',
-    background: '#020617',
-    borderRadius: 10,
-    border: '1px solid #1e293b',
-    padding: 12,
+    fontSize: '0.8rem',
+    lineHeight: 1.6,
+    color: 'var(--text-secondary)',
+    background: 'var(--bg-input)',
+    borderRadius: 8,
+    border: '1px solid var(--border-color)',
+    padding: 16,
+    fontFamily: 'var(--font-mono)',
   },
   subtleLine: {
-    margin: '0 0 10px 0',
-    color: '#94a3b8',
-    fontSize: '0.78rem',
+    margin: '0 0 16px 0',
+    color: 'var(--text-muted)',
+    fontSize: '0.85rem',
   },
   crownForm: {
     display: 'grid',
-    gap: 10,
-    marginBottom: 10,
+    gap: 16,
+    marginBottom: 20,
+  },
+  fetchBox: {
+    border: '1px solid var(--border-color)',
+    background: 'var(--bg-input)',
+    borderRadius: 10,
+    padding: 16,
+    marginBottom: 16,
+  },
+  fetchRow: {
+    display: 'grid',
+    gap: 16,
+    gridTemplateColumns: 'repeat(auto-fit, minmax(240px, 1fr))',
+    alignItems: 'end',
   },
   fileInput: {
-    background: '#0f172a',
-    color: '#e2e8f0',
-    border: '1px solid #334155',
-    borderRadius: 10,
-    padding: '10px 12px',
-    fontFamily: "'JetBrains Mono', monospace",
+    background: 'var(--bg-input)',
+    color: 'var(--text-primary)',
+    border: '1px solid var(--border-color)',
+    borderRadius: 8,
+    padding: '8px 12px',
+    fontFamily: 'var(--font-sans)',
+    fontSize: '0.85rem',
+  },
+  fileName: {
+    color: 'var(--text-muted)',
+    fontSize: '0.75rem',
+    marginTop: 4,
+    display: 'block',
   },
   errorInline: {
-    border: '1px solid rgba(244,63,94,0.45)',
-    background: 'rgba(244,63,94,0.12)',
-    color: '#fecdd3',
-    borderRadius: 10,
-    padding: 10,
+    border: '1px solid rgba(244,63,94,0.3)',
+    background: 'rgba(244,63,94,0.05)',
+    color: '#fca5a5',
+    borderRadius: 8,
+    padding: 12,
     fontSize: '0.8rem',
-    marginTop: 8,
+    marginTop: 12,
   },
   tableWrap: {
     overflowX: 'auto',
-    border: '1px solid rgba(148,163,184,0.25)',
-    borderRadius: 10,
-    background: 'rgba(2,6,23,0.45)',
+    border: '1px solid var(--border-color)',
+    borderRadius: 12,
+    background: 'rgba(255,255,255,0.01)',
   },
   table: {
     width: '100%',
     borderCollapse: 'collapse',
-    fontSize: '0.75rem',
-    color: '#e2e8f0',
+    fontSize: '0.8rem',
+    color: 'var(--text-primary)',
   },
 };

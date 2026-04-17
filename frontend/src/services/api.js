@@ -163,21 +163,42 @@ export async function fitRegionalCalibration(payload) {
     return response.json();
 }
 
-export async function detectCrowns(file, ndviThreshold = 0.45, minAreaPx = 12) {
+export async function detectCrowns(file, ndviThreshold = 0.45, minAreaPx = 12, modelTreeCount = null) {
     const formData = new FormData();
     formData.append('file', file);
-    const response = await fetch(
-        `${API_BASE}/detect-crowns?ndvi_threshold=${encodeURIComponent(ndviThreshold)}&min_area_px=${encodeURIComponent(minAreaPx)}`,
-        {
-            method: 'POST',
-            body: formData,
-        }
-    );
+    
+    let url = `${API_BASE}/detect-crowns?ndvi_threshold=${encodeURIComponent(ndviThreshold)}&min_area_px=${encodeURIComponent(minAreaPx)}`;
+    if (modelTreeCount !== null) {
+        url += `&model_tree_count=${encodeURIComponent(modelTreeCount)}`;
+    }
+
+    const response = await fetch(url, {
+        method: 'POST',
+        body: formData,
+    });
     if (!response.ok) {
         const error = await response.json().catch(() => ({ detail: 'Unknown error' }));
         throw new Error(error.detail || 'Crown detection failed');
     }
     return response.json();
+}
+
+export async function fetchRemoteGeoTiff(payload) {
+    const response = await fetch(`${API_BASE}/fetch-remote-geotiff`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload),
+    });
+    if (!response.ok) {
+        const error = await response.json().catch(() => ({ detail: 'Unknown error' }));
+        throw new Error(error.detail || 'Remote GeoTIFF fetch failed');
+    }
+
+    const blob = await response.blob();
+    const cd = response.headers.get('content-disposition') || '';
+    const match = cd.match(/filename="?([^"]+)"?/i);
+    const filename = match?.[1] || 'remote_patch.tif';
+    return new File([blob], filename, { type: 'image/tiff' });
 }
 
 // ─── Chart Data Endpoints ──────────────────────────────────────────────

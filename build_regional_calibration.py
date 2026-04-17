@@ -153,8 +153,9 @@ def _convert_states_to_simplified_csv(pairs: List[StateZipPair], work_dir: str) 
         out_csv = os.path.join(work_dir, f"{pair.state}_fia.csv")
         result = build_fia_csv_from_datamart(state_dir, out_csv)
         print(
-            f"[convert] {pair.state}: rows_out={result.get('rows_out')} "
-            f"plots={result.get('plots_kept')} tree_rows={result.get('tree_rows_loaded')}"
+            f"[convert] {pair.state}: rows_written={result.get('rows_written')} "
+            f"plots_valid={result.get('plots_valid')}/{result.get('plots_total')} "
+            f"tree_rows_total={result.get('tree_rows_total')}"
         )
         converted.append((pair.state, out_csv))
     return converted

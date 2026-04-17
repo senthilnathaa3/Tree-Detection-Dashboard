@@ -7,9 +7,12 @@ import os
 import json
 import asyncio
 from typing import Optional
+import numpy as np
+import rasterio
 from fastapi import APIRouter, UploadFile, File, HTTPException, Query, BackgroundTasks
 from fastapi.responses import FileResponse, JSONResponse
 from pydantic import BaseModel
+from rasterio.transform import from_bounds as transform_from_bounds
 
 from ..inference import (
     run_inference,
@@ -40,6 +43,7 @@ from ..worldcover_validation import (
 from ..remote_inference import (
     run_remote_inference_planetary_computer,
     run_remote_inference_planetary_computer_grid,
+    fetch_remote_tensor_planetary_computer,
 )
 from ..fia_datamart import build_fia_csv_from_datamart
 from ..calibration import (
@@ -137,6 +141,16 @@ class FiaRegionalCalibrationFitRequest(BaseModel):
     region_column: str = "region"
     min_samples_per_region: int = 5
     output_profile_path: Optional[str] = None
+
+
+class RemoteGeoTiffFetchRequest(BaseModel):
+    lat: float
+    lon: float
+    start_date: str
+    end_date: str
+    radius_km: float = 0.2
+    provider: str = "planetary_computer"
+    cloud_cover_max: float = 40.0
 
 
 def _validate_dataset_structure(dataset_path: str):
@@ -960,10 +974,11 @@ async def detect_crowns(
     file: UploadFile = File(...),
     ndvi_threshold: float = Query(0.45, ge=-1.0, le=1.0),
     min_area_px: int = Query(12, ge=1),
+    model_tree_count: Optional[float] = Query(None, description="Optional target tree count from model to align object detection results."),
 ):
     """
     Object-level tree crown candidate detection from an uploaded GeoTIFF.
-    Uses NDVI thresholding + connected components as a lightweight baseline.
+    Uses NDVI peak finding + watershed segmentation, optionally aligned with model tree count.
     """
     content = await file.read()
     is_valid, message = validate_file(file.filename, len(content))
@@ -972,10 +987,11 @@ async def detect_crowns(
 
     save_path = save_upload(content, file.filename)
     try:
-        result = detect_tree_crowns_ndvi(
+        result = detect_tree_crowns_advanced(
             tif_path=save_path,
             ndvi_threshold=ndvi_threshold,
             min_area_px=min_area_px,
+            model_tree_count=model_tree_count,
         )
         result["filename"] = file.filename
         return result
@@ -987,6 +1003,82 @@ async def detect_crowns(
                 os.remove(save_path)
             except OSError:
                 pass
+
+
+@router.post("/fetch-remote-geotiff")
+async def fetch_remote_geotiff(request: RemoteGeoTiffFetchRequest, background_tasks: BackgroundTasks):
+    """
+    Fetch a remote Sentinel patch by lat/lon+date and return it as a 15-band GeoTIFF.
+    """
+    _validate_lat_lon(request.lat, request.lon)
+
+    if request.provider.strip().lower() != "planetary_computer":
+        raise HTTPException(
+            status_code=400,
+            detail="Unsupported provider. Currently only 'planetary_computer' is supported.",
+        )
+    if request.radius_km <= 0:
+        raise HTTPException(status_code=400, detail="radius_km must be > 0.")
+
+    try:
+        tensor, metadata = fetch_remote_tensor_planetary_computer(
+            lat=request.lat,
+            lon=request.lon,
+            start_date=request.start_date,
+            end_date=request.end_date,
+            radius_km=request.radius_km,
+            cloud_cover_max=request.cloud_cover_max,
+        )
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Remote fetch failed: {e}")
+
+    arr = tensor.squeeze(0).cpu().numpy().astype(np.float32)
+    if arr.ndim != 3 or arr.shape[0] < 2:
+        raise HTTPException(status_code=500, detail="Fetched tensor has invalid shape for GeoTIFF export.")
+
+    aoi = metadata.get("aoi", {})
+    west = aoi.get("west")
+    south = aoi.get("south")
+    east = aoi.get("east")
+    north = aoi.get("north")
+    if west is None or south is None or east is None or north is None:
+        raise HTTPException(status_code=500, detail="Missing AOI bounds in remote metadata.")
+
+    out_dir = os.path.join(UPLOAD_DIR, "remote_exports")
+    os.makedirs(out_dir, exist_ok=True)
+    basename = (
+        f"remote_{request.lat:.5f}_{request.lon:.5f}_{request.start_date}_{request.end_date}.tif"
+        .replace(":", "_")
+        .replace("/", "-")
+        .replace(" ", "_")
+    )
+    out_path = os.path.join(out_dir, basename)
+
+    height, width = int(arr.shape[1]), int(arr.shape[2])
+    transform = transform_from_bounds(float(west), float(south), float(east), float(north), width, height)
+    profile = {
+        "driver": "GTiff",
+        "height": height,
+        "width": width,
+        "count": int(arr.shape[0]),
+        "dtype": "float32",
+        "crs": "EPSG:4326",
+        "transform": transform,
+        "compress": "lzw",
+    }
+
+    try:
+        with rasterio.open(out_path, "w", **profile) as dst:
+            dst.write(arr)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to write GeoTIFF: {e}")
+
+    background_tasks.add_task(os.remove, out_path)
+    return FileResponse(
+        path=out_path,
+        media_type="image/tiff",
+        filename=basename,
+    )
 
 
 # ─── Single File Endpoints ──────────────────────────────────────────────

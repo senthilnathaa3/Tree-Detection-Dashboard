@@ -214,7 +214,9 @@ def run_remote_inference_planetary_computer(
     """
     Fetch S1/S2 from Planetary Computer by location/date and run model inference.
     """
-    west, south, east, north = _bbox_from_center_radius(lat, lon, radius_km)
+    # Always use a standard 200m patch (0.1km radius) for the model, regardless of AOI
+    patch_radius = 0.1
+    west, south, east, north = _bbox_from_center_radius(lat, lon, patch_radius)
     items = _search_planetary_computer_items(lat, lon, start_date, end_date, cloud_cover_max=cloud_cover_max)
 
     tensor = _build_15ch_tensor_from_items(items, west, south, east, north)
