@@ -65,6 +65,9 @@ Navigate to `http://localhost:5173`
 - **Head 1**: Tree density regression (sigmoid, 0-1)
 - **Head 2**: Multi-label species classification (20 species)
 - **Checkpoint**: `backend/checkpoints/best_model.pth`
+- **Model Variant Switch**:
+  - `MODEL_VARIANT=v1` (default, ResNet18 baseline)
+  - `MODEL_VARIANT=v2` (spectral stem + ResNet34 + stronger heads)
 
 ### API Endpoints
 
