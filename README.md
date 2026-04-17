@@ -183,3 +183,34 @@ Notes:
 - `PLOT.csv` is required.
 - `TREE.csv` is optional; if present, it is used to compute `trees_per_acre` and dominant species.
 - Output CSV columns: `source_plot_id, lat, lon, year, species, trees_per_acre, trees_per_hectare`.
+
+### Fit and Apply FIA Calibration
+
+To reduce model-vs-FIA bias, fit linear calibration from historical AOI runs.
+
+1) Prepare a CSV with columns:
+- `model_tph`
+- `fia_tph`
+
+2) Fit calibration:
+
+`POST /api/fit-fia-calibration`
+
+```json
+{
+  "calibration_csv_path": "/path/to/calibration_samples.csv"
+}
+```
+
+Response gives:
+- `fit.slope`
+- `fit.intercept`
+
+3) Apply calibration in location validation:
+
+`POST /api/validate-location` with extra fields:
+- `calibration_slope`
+- `calibration_intercept`
+
+The response then includes calibrated agreement fields:
+- `comparison.density_agreement_calibrated` (FIA mode)

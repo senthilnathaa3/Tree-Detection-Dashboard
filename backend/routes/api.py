@@ -39,6 +39,11 @@ from ..worldcover_validation import (
 )
 from ..remote_inference import run_remote_inference_planetary_computer
 from ..fia_datamart import build_fia_csv_from_datamart
+from ..calibration import (
+    load_calibration_samples_csv,
+    fit_linear_tph_calibration,
+    apply_linear_tph_calibration,
+)
 
 router = APIRouter()
 
@@ -102,11 +107,17 @@ class LocationValidationRequest(BaseModel):
     worldcover_path: Optional[str] = None
     year_start: Optional[int] = None
     year_end: Optional[int] = None
+    calibration_slope: Optional[float] = None
+    calibration_intercept: Optional[float] = None
 
 
 class FIADatamartConvertRequest(BaseModel):
     source_path: str
     output_csv_path: Optional[str] = None
+
+
+class FIACalibrationFitRequest(BaseModel):
+    calibration_csv_path: str
 
 
 def _validate_dataset_structure(dataset_path: str):
@@ -536,6 +547,24 @@ async def validate_location(request: LocationValidationRequest):
         else _model_summary_from_single_result(model_remote) if model_remote else {}
     )
 
+    calibration = None
+    calibrated_model_tph = None
+    if request.calibration_slope is not None and request.calibration_intercept is not None:
+        model_tph = model_summary.get("mean_trees_per_hectare")
+        if model_tph is not None:
+            calibrated_model_tph = apply_linear_tph_calibration(
+                model_tph,
+                request.calibration_slope,
+                request.calibration_intercept,
+            )
+            calibration = {
+                "method": "linear",
+                "slope": request.calibration_slope,
+                "intercept": request.calibration_intercept,
+                "model_tph_raw": model_tph,
+                "model_tph_calibrated": round(calibrated_model_tph, 6),
+            }
+
     if source == "fia":
         if not request.fia_csv_path:
             raise HTTPException(status_code=400, detail="fia_csv_path is required when validation_source='fia'.")
@@ -576,6 +605,18 @@ async def validate_location(request: LocationValidationRequest):
                 ],
             }
         )
+        if calibrated_model_tph is not None:
+            fia_tph = ext_summary.get("trees_per_hectare", {}).get("mean")
+            cal_block = {
+                "model_tph_calibrated": round(calibrated_model_tph, 6),
+                "fia_mean_trees_per_hectare": fia_tph,
+            }
+            if fia_tph is not None:
+                abs_diff = calibrated_model_tph - float(fia_tph)
+                pct = (abs_diff / float(fia_tph) * 100.0) if float(fia_tph) != 0 else None
+                cal_block["absolute_difference"] = round(abs_diff, 6)
+                cal_block["percent_difference"] = round(pct, 6) if pct is not None else None
+            comparison["density_agreement_calibrated"] = cal_block
 
         return {
             "status": "success",
@@ -591,6 +632,7 @@ async def validate_location(request: LocationValidationRequest):
                 if model_result
                 else model_remote.get("aoi", {}) if model_remote else aoi
             ),
+            "calibration": calibration,
             "model": (
                 {
                     "status": "ran",
@@ -671,6 +713,12 @@ async def validate_location(request: LocationValidationRequest):
             ],
         }
     )
+    if calibrated_model_tph is not None:
+        comparison["density_vs_treecover_calibrated_tph"] = {
+            "model_tph_calibrated": round(calibrated_model_tph, 6),
+            "worldcover_tree_fraction": wc_summary.get("tree_cover_fraction"),
+            "note": "WorldCover is fraction-based; calibrated TPH is density-based, so compare directionally.",
+        }
 
     return {
         "status": "success",
@@ -686,6 +734,7 @@ async def validate_location(request: LocationValidationRequest):
             if model_result
             else model_remote.get("aoi", {}) if model_remote else aoi
         ),
+        "calibration": calibration,
         "model": (
             {
                 "status": "ran",
@@ -759,6 +808,31 @@ async def convert_fia_datamart(request: FIADatamartConvertRequest):
         raise HTTPException(status_code=500, detail=f"FIA conversion failed: {e}")
 
     return result
+
+
+@router.post("/fit-fia-calibration")
+async def fit_fia_calibration(request: FIACalibrationFitRequest):
+    """
+    Fit linear calibration from historical AOI runs:
+    fia_tph = slope * model_tph + intercept
+    """
+    csv_path = os.path.abspath(os.path.expanduser(request.calibration_csv_path))
+    if not os.path.isfile(csv_path):
+        raise HTTPException(status_code=400, detail=f"Calibration CSV not found: {csv_path}")
+
+    try:
+        samples = load_calibration_samples_csv(csv_path)
+        fit = fit_linear_tph_calibration(samples)
+    except (ValueError, FileNotFoundError) as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Calibration fit failed: {e}")
+
+    return {
+        "status": "success",
+        "calibration_csv_path": csv_path,
+        "fit": fit,
+    }
 
 
 # ─── Single File Endpoints ──────────────────────────────────────────────
