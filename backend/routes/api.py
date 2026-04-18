@@ -48,6 +48,7 @@ from ..remote_inference import (
     run_remote_inference_planetary_computer,
     run_remote_inference_planetary_computer_grid,
     fetch_remote_tensor_planetary_computer,
+    fetch_remote_naip_visual_planetary_computer,
 )
 from ..fia_datamart import build_fia_csv_from_datamart
 from ..calibration import (
@@ -163,6 +164,7 @@ class LocationValidationWithCrownsRequest(LocationValidationRequest):
     crown_min_area_px: int = 12
     crown_align_with_model: bool = True
     crown_max_candidates: int = 5000
+    include_pitch_visuals: bool = False
 
 
 def _validate_dataset_structure(dataset_path: str):
@@ -263,34 +265,116 @@ def _write_remote_tensor_to_tiff(tensor, metadata: dict, prefix: str = "remote_t
     return out_path
 
 
-def _annotated_rgb_png_data_url(tif_path: str, detections: list[dict], max_detections: int = 80) -> str:
+def _write_array_to_tiff(arr: np.ndarray, metadata: dict, prefix: str = "remote_arr_") -> str:
+    if arr.ndim != 3 or arr.shape[0] < 2:
+        raise ValueError("Fetched array has invalid shape for GeoTIFF export.")
+
+    aoi = metadata.get("aoi", {})
+    west = aoi.get("west")
+    south = aoi.get("south")
+    east = aoi.get("east")
+    north = aoi.get("north")
+    if west is None or south is None or east is None or north is None:
+        raise ValueError("Missing AOI bounds in remote metadata.")
+
+    height, width = int(arr.shape[1]), int(arr.shape[2])
+    transform = transform_from_bounds(float(west), float(south), float(east), float(north), width, height)
+    profile = {
+        "driver": "GTiff",
+        "height": height,
+        "width": width,
+        "count": int(arr.shape[0]),
+        "dtype": "float32",
+        "crs": "EPSG:4326",
+        "transform": transform,
+        "compress": "lzw",
+    }
+    tmp_fd, out_path = tempfile.mkstemp(prefix=prefix, suffix=".tif", dir=UPLOAD_DIR)
+    os.close(tmp_fd)
+    with rasterio.open(out_path, "w", **profile) as dst:
+        dst.write(arr.astype(np.float32))
+    return out_path
+
+
+def _distance_sq(a: tuple[float, float], b: tuple[float, float]) -> float:
+    dx = float(a[0]) - float(b[0])
+    dy = float(a[1]) - float(b[1])
+    return dx * dx + dy * dy
+
+
+def _presentation_detections(
+    detections: list[dict],
+    max_detections: int = 28,
+    min_center_distance_px: float = 10.0,
+) -> list[dict]:
+    if not detections:
+        return []
+
+    selected: list[dict] = []
+    min_dist_sq = float(min_center_distance_px) ** 2
+    ranked = sorted(
+        detections,
+        key=lambda d: (
+            float(d.get("score", 0.0)),
+            float(d.get("area_px", 0.0)),
+        ),
+        reverse=True,
+    )
+
+    for det in ranked:
+        centroid = det.get("centroid_px") or {}
+        center = (float(centroid.get("x", 0.0)), float(centroid.get("y", 0.0)))
+        if any(
+            _distance_sq(
+                center,
+                (
+                    float(existing.get("centroid_px", {}).get("x", 0.0)),
+                    float(existing.get("centroid_px", {}).get("y", 0.0)),
+                ),
+            ) < min_dist_sq
+            for existing in selected
+        ):
+            continue
+        selected.append(det)
+        if len(selected) >= max_detections:
+            break
+    return selected
+
+
+def _annotated_rgb_png_data_url(tif_path: str, detections: list[dict], max_detections: int = 28) -> str:
     with rasterio.open(tif_path) as src:
         arr = src.read().astype(np.float32)
 
-    if arr.shape[0] < 4:
+    if arr.shape[0] >= 15:
+        rgb = np.stack([arr[3], arr[2], arr[1]], axis=-1)
+    elif arr.shape[0] >= 3:
+        rgb = np.stack([arr[0], arr[1], arr[2]], axis=-1)
+    else:
         raise ValueError("GeoTIFF does not contain enough bands for RGB rendering.")
 
-    rgb = np.stack([arr[3], arr[2], arr[1]], axis=-1)
-    p2 = np.percentile(rgb, 2)
-    p98 = np.percentile(rgb, 98)
-    rgb = np.clip((rgb - p2) / (max(1e-6, p98 - p2)), 0.0, 1.0)
+    p2 = np.percentile(rgb, 2, axis=(0, 1))
+    p98 = np.percentile(rgb, 98, axis=(0, 1))
+    rgb = np.clip((rgb - p2) / np.maximum(1e-6, (p98 - p2)), 0.0, 1.0)
     image = Image.fromarray((rgb * 255).astype(np.uint8))
     draw = ImageDraw.Draw(image)
 
-    for det in detections[:max_detections]:
+    presentable = _presentation_detections(detections, max_detections=max_detections)
+
+    for det in presentable:
         bbox = det.get("bbox_px", {})
-        if not bbox:
-            continue
-        x0 = int(bbox.get("xmin", 0))
-        y0 = int(bbox.get("ymin", 0))
-        x1 = int(bbox.get("xmax", 0))
-        y1 = int(bbox.get("ymax", 0))
-        draw.rectangle([x0, y0, x1, y1], outline=(102, 255, 102), width=2)
+        width = max(4, int(bbox.get("xmax", 0)) - int(bbox.get("xmin", 0)))
+        height = max(4, int(bbox.get("ymax", 0)) - int(bbox.get("ymin", 0)))
+        radius = max(5, min(18, int(round(max(width, height) * 0.45))))
         centroid = det.get("centroid_px")
         if centroid:
             cx = int(round(float(centroid.get("x", 0))))
             cy = int(round(float(centroid.get("y", 0))))
-            draw.ellipse([cx - 2, cy - 2, cx + 2, cy + 2], fill=(255, 84, 84))
+            draw.ellipse(
+                [cx - radius, cy - radius, cx + radius, cy + radius],
+                outline=(115, 250, 174),
+                width=2,
+            )
+            draw.ellipse([cx - 2, cy - 2, cx + 2, cy + 2], fill=(255, 240, 84))
 
     buf = io.BytesIO()
     image.save(buf, format="PNG")
@@ -340,6 +424,7 @@ def _build_pitch_regions(
     request: LocationValidationWithCrownsRequest,
     validation: dict,
     fia_loaded: Optional[dict],
+    include_visuals: bool = True,
 ) -> Optional[dict]:
     remote_grid = validation.get("model", {}).get("remote_grid", {})
     per_point = remote_grid.get("per_point_predictions") or []
@@ -368,6 +453,19 @@ def _build_pitch_regions(
             request.year_start,
             request.year_end,
         )
+        plots_in_patch = int(patch_fia.get("plots_in_patch") or 0)
+        if plots_in_patch >= 3:
+            support_strength = "strong"
+        elif plots_in_patch >= 1:
+            support_strength = "limited"
+        else:
+            support_strength = "none"
+
+        patch_pct_diff = None
+        patch_fia_tph = patch_fia.get("trees_per_hectare")
+        if patch_fia_tph not in (None, 0):
+            patch_pct_diff = round(((cal_tph - float(patch_fia_tph)) / float(patch_fia_tph)) * 100.0, 4)
+
         enriched.append(
             {
                 "patch_id": point.get("filename", f"grid_{idx:03d}"),
@@ -381,6 +479,8 @@ def _build_pitch_regions(
                 "remote_source": point.get("remote_source", {}),
                 "patch_aoi": patch_aoi,
                 "fia_local": patch_fia,
+                "fia_support_strength": support_strength,
+                "patch_percent_difference_vs_fia": patch_pct_diff,
             }
         )
 
@@ -412,46 +512,76 @@ def _build_pitch_regions(
         group = grouped[bucket]
         if not group:
             continue
-        selected = sorted(group, key=lambda item: item["calibrated_tph"], reverse=(bucket == "high"))
-        rep = selected[0] if bucket != "medium" else selected[len(selected) // 2]
-        side_meters = request.crown_radius_km * 2000
-        pixels = int(min(1024, max(64, side_meters / 10.0)))
-        out_shape = (pixels, pixels)
-        try:
-            tensor, metadata = fetch_remote_tensor_planetary_computer(
-                lat=rep["patch_aoi"]["center_lat"],
-                lon=rep["patch_aoi"]["center_lon"],
-                start_date=request.start_date,
-                end_date=request.end_date,
-                radius_km=request.crown_radius_km,
-                cloud_cover_max=request.cloud_cover_max,
-                out_shape=out_shape,
-            )
-            temp_tif = _write_remote_tensor_to_tiff(tensor, metadata, prefix=f"pitch_{bucket}_")
-            model_target_count = None
-            if request.crown_align_with_model:
-                crown_area_ha = (np.pi * (float(request.crown_radius_km) ** 2)) * 100.0
-                model_target_count = rep["calibrated_tph"] * crown_area_ha
-            crown_result = detect_tree_crowns_advanced(
-                tif_path=temp_tif,
-                ndvi_threshold=request.crown_ndvi_threshold,
-                min_area_px=request.crown_min_area_px,
-                model_tree_count=model_target_count,
-                max_candidates=request.crown_max_candidates,
-                include_geojson=True,
-            )
-            annotated_png = _annotated_rgb_png_data_url(temp_tif, crown_result.get("detections", []))
-            crown_result["annotated_image_data_url"] = annotated_png
-            crown_result["remote_source"] = metadata
-            rep["crown_annotation"] = crown_result
-        except Exception as e:
-            rep["crown_annotation"] = {"status": "error", "detail": str(e)}
-        finally:
-            if "temp_tif" in locals() and os.path.exists(temp_tif):
+        def representative_sort_key(item: dict) -> tuple:
+            support_rank = {"strong": 2, "limited": 1, "none": 0}.get(item.get("fia_support_strength", "none"), 0)
+            closeness = abs(float(item.get("patch_percent_difference_vs_fia"))) if item.get("patch_percent_difference_vs_fia") is not None else 1e9
+            tph = float(item.get("calibrated_tph", 0.0))
+            if bucket == "low":
+                return (-support_rank, closeness, tph)
+            if bucket == "medium":
+                return (-support_rank, closeness, abs(tph - float(np.median(values))))
+            return (-support_rank, closeness, -tph)
+
+        selected = sorted(group, key=representative_sort_key)
+        rep = selected[0]
+        if not include_visuals:
+            rep["crown_annotation"] = {
+                "status": "not_run",
+                "reason": "Representative visuals disabled for faster run.",
+            }
+        else:
+            side_meters = request.crown_radius_km * 2000
+            pixels = int(min(1024, max(64, side_meters / 10.0)))
+            out_shape = (pixels, pixels)
+            try:
+                imagery_source = "naip"
                 try:
-                    os.remove(temp_tif)
-                except OSError:
-                    pass
+                    naip_arr, metadata = fetch_remote_naip_visual_planetary_computer(
+                        lat=rep["patch_aoi"]["center_lat"],
+                        lon=rep["patch_aoi"]["center_lon"],
+                        start_date=request.start_date,
+                        end_date=request.end_date,
+                        radius_km=request.crown_radius_km,
+                        out_shape=out_shape,
+                    )
+                    temp_tif = _write_array_to_tiff(naip_arr, metadata, prefix=f"pitch_{bucket}_naip_")
+                except Exception:
+                    imagery_source = "sentinel"
+                    tensor, metadata = fetch_remote_tensor_planetary_computer(
+                        lat=rep["patch_aoi"]["center_lat"],
+                        lon=rep["patch_aoi"]["center_lon"],
+                        start_date=request.start_date,
+                        end_date=request.end_date,
+                        radius_km=request.crown_radius_km,
+                        cloud_cover_max=request.cloud_cover_max,
+                        out_shape=out_shape,
+                    )
+                    temp_tif = _write_remote_tensor_to_tiff(tensor, metadata, prefix=f"pitch_{bucket}_sentinel_")
+                model_target_count = None
+                if request.crown_align_with_model:
+                    crown_area_ha = (np.pi * (float(request.crown_radius_km) ** 2)) * 100.0
+                    model_target_count = rep["calibrated_tph"] * crown_area_ha
+                crown_result = detect_tree_crowns_advanced(
+                    tif_path=temp_tif,
+                    ndvi_threshold=request.crown_ndvi_threshold,
+                    min_area_px=request.crown_min_area_px,
+                    model_tree_count=model_target_count,
+                    max_candidates=request.crown_max_candidates,
+                    include_geojson=True,
+                )
+                annotated_png = _annotated_rgb_png_data_url(temp_tif, crown_result.get("detections", []))
+                crown_result["annotated_image_data_url"] = annotated_png
+                crown_result["remote_source"] = metadata
+                crown_result["imagery_source"] = imagery_source
+                rep["crown_annotation"] = crown_result
+            except Exception as e:
+                rep["crown_annotation"] = {"status": "error", "detail": str(e)}
+            finally:
+                if "temp_tif" in locals() and os.path.exists(temp_tif):
+                    try:
+                        os.remove(temp_tif)
+                    except OSError:
+                        pass
 
         representatives.append(rep)
 
@@ -480,6 +610,36 @@ def _build_pitch_regions(
             "Patch-local FIA is shown only when FIA plots fall inside that sampled patch.",
             "AOI-level FIA remains the primary validation benchmark.",
         ],
+    }
+
+
+def _summarize_representative_crowns(pitch_regions: Optional[dict]) -> dict:
+    reps = (pitch_regions or {}).get("representatives", []) or []
+    if not reps:
+        return {
+            "status": "not_run",
+            "reason": "Representative patch crowns unavailable.",
+        }
+
+    if all((rep.get("crown_annotation", {}) or {}).get("status") == "not_run" for rep in reps):
+        return {
+            "status": "not_run",
+            "reason": "Representative visuals disabled for faster run.",
+        }
+
+    candidate_counts = []
+    for rep in reps:
+        crown = rep.get("crown_annotation", {}) or {}
+        count = crown.get("candidate_count")
+        if count is not None:
+            candidate_counts.append(int(count))
+
+    return {
+        "status": "success",
+        "method": "representative_patch_summary",
+        "candidate_count": int(sum(candidate_counts)) if candidate_counts else 0,
+        "representative_patch_count": len(reps),
+        "note": "Crowns shown on representative high/medium/low patches to keep pitch runs fast.",
     }
 
 
@@ -1236,6 +1396,12 @@ async def validate_location_crowns(request: LocationValidationWithCrownsRequest)
             fia_loaded = load_fia_csv(request.fia_csv_path)
         except Exception:
             fia_loaded = None
+    pitch_regions = _build_pitch_regions(
+        request,
+        validation,
+        fia_loaded,
+        include_visuals=bool(request.include_pitch_visuals),
+    )
 
     if not request.start_date or not request.end_date:
         return {
@@ -1245,56 +1411,10 @@ async def validate_location_crowns(request: LocationValidationWithCrownsRequest)
                 "status": "not_run",
                 "reason": "start_date and end_date are required for crown detection remote fetch.",
             },
+            "pitch_regions": pitch_regions,
         }
 
-    # Compute optional target count from model summary/calibration for alignment.
-    model_target_count = None
-    if request.crown_align_with_model:
-        cal = validation.get("comparison", {}).get("density_agreement_calibrated", {})
-        model_summary = validation.get("model", {}).get("summary", {})
-        tph = cal.get("model_tph_calibrated")
-        if tph is None:
-            tph = model_summary.get("mean_trees_per_hectare")
-        if tph is not None:
-            crown_area_ha = (np.pi * (float(request.crown_radius_km) ** 2)) * 100.0
-            model_target_count = float(tph) * crown_area_ha
-
-    side_meters = request.crown_radius_km * 2000
-    target_res_meters = 10.0
-    pixels = int(min(1024, max(64, side_meters / target_res_meters)))
-    out_shape = (pixels, pixels)
-
-    try:
-        tensor, metadata = fetch_remote_tensor_planetary_computer(
-            lat=request.lat,
-            lon=request.lon,
-            start_date=request.start_date,
-            end_date=request.end_date,
-            radius_km=request.crown_radius_km,
-            cloud_cover_max=request.cloud_cover_max,
-            out_shape=out_shape,
-        )
-        temp_tif = _write_remote_tensor_to_tiff(tensor, metadata, prefix="crown_remote_")
-        crowns = detect_tree_crowns_advanced(
-            tif_path=temp_tif,
-            ndvi_threshold=request.crown_ndvi_threshold,
-            min_area_px=request.crown_min_area_px,
-            model_tree_count=model_target_count,
-            max_candidates=request.crown_max_candidates,
-            include_geojson=True,
-        )
-        crowns["remote_source"] = metadata
-        crowns["status"] = "success"
-    except Exception as e:
-        crowns = {"status": "error", "detail": str(e)}
-    finally:
-        if "temp_tif" in locals() and os.path.exists(temp_tif):
-            try:
-                os.remove(temp_tif)
-            except OSError:
-                pass
-
-    pitch_regions = _build_pitch_regions(request, validation, fia_loaded)
+    crowns = _summarize_representative_crowns(pitch_regions)
 
     return {
         "status": "success",

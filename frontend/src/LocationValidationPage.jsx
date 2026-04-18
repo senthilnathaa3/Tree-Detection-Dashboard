@@ -35,6 +35,7 @@ const DEFAULT_FORM = {
   crown_min_area_px: 24,
   crown_max_candidates: 5000,
   crown_align_with_model: true,
+  include_pitch_visuals: false,
 };
 
 function fmtNum(v, digits = 1) {
@@ -91,6 +92,9 @@ function Kpi({ title, value, subtitle, tone = '#3b82f6' }) {
 function RepresentativeCard({ title, patch }) {
   const crown = patch?.crown_annotation || {};
   const localFia = patch?.fia_local || {};
+  const support = patch?.fia_support_strength || 'none';
+  const pctDiff = patch?.patch_percent_difference_vs_fia;
+  const imagerySource = crown?.imagery_source || 'sentinel';
   return (
     <section style={styles.card}>
       <div style={styles.repHeader}>
@@ -105,13 +109,21 @@ function RepresentativeCard({ title, patch }) {
       {crown?.annotated_image_data_url ? (
         <img src={crown.annotated_image_data_url} alt={`${title} crown annotation`} style={styles.repImage} />
       ) : (
-        <div style={styles.smallText}>Annotated crown image unavailable.</div>
+        <div style={styles.smallText}>
+          {crown?.reason || 'Annotated crown image unavailable.'}
+        </div>
       )}
+      <div style={styles.repCaption}>
+        Presentation overlay uses sparse crown markers for readability, not full candidate boxes.
+        {crown?.annotated_image_data_url ? ` Visual source: ${imagerySource}.` : ''}
+      </div>
       <div style={styles.repFacts}>
         <div><strong>Patch Trees</strong><span>{fmtNum(patch?.patch_tree_count_calibrated, 1)}</span></div>
         <div><strong>Dominant Species</strong><span>{patch?.dominant_species || '—'}</span></div>
         <div><strong>Crown Candidates</strong><span>{fmtNum(crown?.candidate_count, 0)}</span></div>
         <div><strong>Local FIA TPH</strong><span>{fmtNum(localFia?.trees_per_hectare, 1)}</span></div>
+        <div><strong>FIA Support</strong><span>{support}</span></div>
+        <div><strong>Patch vs FIA</strong><span>{pctDiff === null || pctDiff === undefined ? '—' : `${fmtNum(pctDiff, 1)}%`}</span></div>
       </div>
       <div style={styles.smallText}>{localFia?.note || 'AOI FIA is the primary benchmark for this pitch.'}</div>
     </section>
@@ -259,6 +271,7 @@ export default function LocationValidationPage() {
       crown_min_area_px: Number(form.crown_min_area_px),
       crown_max_candidates: Number(form.crown_max_candidates),
       crown_align_with_model: Boolean(form.crown_align_with_model),
+      include_pitch_visuals: Boolean(form.include_pitch_visuals),
     };
 
     try {
@@ -396,8 +409,22 @@ export default function LocationValidationPage() {
               <span style={{ fontSize: '0.82rem', color: 'var(--text-secondary)' }}>Align crown count with model TPH</span>
             </label>
 
+            <label style={{ ...styles.field, display: 'flex', gap: 8, alignItems: 'center', marginTop: 2 }}>
+              <input
+                type="checkbox"
+                checked={Boolean(form.include_pitch_visuals)}
+                onChange={(e) => setField('include_pitch_visuals', e.target.checked)}
+              />
+              <span style={{ fontSize: '0.82rem', color: 'var(--text-secondary)' }}>
+                Generate representative patch visuals
+              </span>
+            </label>
+            <div style={styles.smallText}>
+              Off: faster AOI density + FIA zoning. On: slower run with annotated patch cards.
+            </div>
+
             <button type="submit" style={styles.primaryBtn} disabled={loading}>
-              {loading ? 'Running…' : 'Run Validation + Crowns'}
+              {loading ? 'Running…' : form.include_pitch_visuals ? 'Run Full Pitch' : 'Run Fast Density'}
             </button>
           </form>
           </aside>
@@ -624,6 +651,11 @@ const styles = {
     borderRadius: 10,
     border: '1px solid var(--border-color)',
     background: 'var(--bg-elevated)',
+  },
+  repCaption: {
+    color: 'var(--text-muted)',
+    fontSize: '0.74rem',
+    lineHeight: 1.4,
   },
   repFacts: {
     display: 'grid',

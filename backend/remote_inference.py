@@ -100,6 +100,53 @@ def _read_asset_window(
         return arr
 
 
+def _read_asset_window_multiband(
+    asset_href: str,
+    west: float,
+    south: float,
+    east: float,
+    north: float,
+    out_shape: Optional[Tuple[int, int]] = (64, 64),
+    band_indexes: Optional[List[int]] = None,
+) -> np.ndarray:
+    with rasterio.open(asset_href) as src:
+        if src.crs and src.crs != CRS.from_epsg(4326):
+            left, bottom, right, top = transform_bounds(
+                CRS.from_epsg(4326), src.crs, west, south, east, north
+            )
+        else:
+            left, bottom, right, top = west, south, east, north
+
+        win = from_bounds(left, bottom, right, top, src.transform)
+        win = win.round_offsets().round_lengths()
+
+        col_off = max(0, int(win.col_off))
+        row_off = max(0, int(win.row_off))
+        width = int(win.width)
+        height = int(win.height)
+        indexes = band_indexes or list(range(1, src.count + 1))
+        shape = out_shape or (64, 64)
+
+        if col_off >= src.width or row_off >= src.height or width <= 0 or height <= 0:
+            return np.zeros((len(indexes), shape[0], shape[1]), dtype=np.float32)
+
+        width = min(width, src.width - col_off)
+        height = min(height, src.height - row_off)
+        read_kwargs = {
+            "window": ((row_off, row_off + height), (col_off, col_off + width)),
+            "resampling": rasterio.enums.Resampling.bilinear,
+        }
+        if out_shape:
+            read_kwargs["out_shape"] = (len(indexes), *shape)
+
+        arr = src.read(indexes=indexes, **read_kwargs).astype(np.float32)
+        nodata = src.nodata
+        if nodata is not None:
+            arr = np.where(arr == nodata, 0.0, arr)
+        arr[~np.isfinite(arr)] = 0.0
+        return arr
+
+
 def _pick_best_item(items: list, prefer_low_cloud: bool = False, reference_dt: Optional[datetime] = None):
     if not items:
         return None
@@ -181,6 +228,47 @@ def _search_planetary_computer_items(
     s2 = planetary_computer.sign(s2)
     s1 = planetary_computer.sign(s1)
     return SelectedItems(s2=s2, s1=s1)
+
+
+def _search_planetary_computer_naip_item(
+    lat: float,
+    lon: float,
+    start_date: str,
+    end_date: str,
+):
+    try:
+        from pystac_client import Client
+        import planetary_computer
+    except ImportError as e:
+        raise RuntimeError(
+            "Missing dependencies for remote fetch. Install: pystac-client planetary-computer"
+        ) from e
+
+    catalog = Client.open("https://planetarycomputer.microsoft.com/api/stac/v1")
+    west, south, east, north = _bbox_from_center_radius(lat, lon, radius_km=1.0)
+    dt_range = f"{start_date}/{end_date}"
+    search = catalog.search(
+        collections=["naip"],
+        bbox=[west, south, east, north],
+        datetime=dt_range,
+        limit=50,
+    )
+    items = list(search.items())
+    if not items:
+        raise ValueError("No NAIP items found for the requested location/date range.")
+
+    ref = None
+    try:
+        start_dt = datetime.fromisoformat(start_date).replace(tzinfo=timezone.utc)
+        end_dt = datetime.fromisoformat(end_date).replace(tzinfo=timezone.utc)
+        ref = start_dt + (end_dt - start_dt) / 2
+    except ValueError:
+        ref = None
+
+    item = _pick_best_item(items, prefer_low_cloud=False, reference_dt=ref)
+    if item is None:
+        raise ValueError("No NAIP item could be selected.")
+    return planetary_computer.sign(item)
 
 
 def _build_15ch_tensor_from_items(
@@ -318,6 +406,51 @@ def fetch_remote_tensor_planetary_computer(
         },
     }
     return tensor, metadata
+
+
+def fetch_remote_naip_visual_planetary_computer(
+    lat: float,
+    lon: float,
+    start_date: str,
+    end_date: str,
+    radius_km: float = 0.2,
+    out_shape: Optional[Tuple[int, int]] = (512, 512),
+) -> Tuple[np.ndarray, Dict[str, Any]]:
+    west, south, east, north = _bbox_from_center_radius(lat, lon, radius_km)
+    item = _search_planetary_computer_naip_item(lat, lon, start_date, end_date)
+    asset = item.assets.get("image")
+    if asset is None or not asset.href:
+        raise ValueError("Selected NAIP item does not expose an image asset.")
+
+    bands = min(4, len(getattr(asset, "extra_fields", {}).get("eo:bands", [])) or 4)
+    indexes = list(range(1, bands + 1))
+    arr = _read_asset_window_multiband(
+        asset.href,
+        west,
+        south,
+        east,
+        north,
+        out_shape=out_shape,
+        band_indexes=indexes,
+    )
+    metadata = {
+        "provider": "planetary_computer_naip",
+        "collection": "naip",
+        "item_id": item.id,
+        "datetime": item.datetime.isoformat() if item.datetime else None,
+        "search_date_range": {"start": start_date, "end": end_date},
+        "aoi": {
+            "west": round(west, 6),
+            "south": round(south, 6),
+            "east": round(east, 6),
+            "north": round(north, 6),
+            "center_lat": round(lat, 6),
+            "center_lon": round(lon, 6),
+            "radius_km": radius_km,
+        },
+        "band_count": int(arr.shape[0]),
+    }
+    return arr.astype(np.float32), metadata
 
 
 def _grid_points(lat: float, lon: float, radius_km: float, grid_size: int) -> List[Tuple[float, float]]:

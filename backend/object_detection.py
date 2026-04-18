@@ -23,6 +23,18 @@ def _normalize_ndvi(red: np.ndarray, nir: np.ndarray) -> np.ndarray:
     return ndvi
 
 
+def _pick_red_nir(arr: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    bands = int(arr.shape[0])
+    if bands >= 15:
+        return arr[3], arr[7]
+    if bands >= 4:
+        # NAIP RGBN
+        return arr[0], arr[3]
+    if bands >= 2:
+        return arr[0], arr[1]
+    raise ValueError("Need at least 2 bands for NDVI-based crown detection")
+
+
 def detect_tree_crowns_advanced(
     tif_path: str,
     ndvi_threshold: float = 0.45,
@@ -40,14 +52,7 @@ def detect_tree_crowns_advanced(
         transform = src.transform
         crs = str(src.crs) if src.crs else None
 
-    if arr.shape[0] >= 8:
-        red = arr[3]
-        nir = arr[7]
-    elif arr.shape[0] >= 2:
-        red = arr[0]
-        nir = arr[1]
-    else:
-        raise ValueError("Need at least 2 bands for NDVI-based crown detection")
+    red, nir = _pick_red_nir(arr)
 
     ndvi = _normalize_ndvi(red, nir)
     
