@@ -814,12 +814,7 @@ async def validate_location(request: LocationValidationRequest):
                 "validation_source": "fia",
                 "provider": request.provider,
             },
-            "aoi": (
-                model_result.get("aoi", {})
-                if model_result
-                else aoi if model_remote_grid
-                else model_remote.get("aoi", {}) if model_remote else aoi
-            ),
+            "aoi": aoi,
             "calibration": calibration,
             "model": (
                 {
@@ -856,6 +851,8 @@ async def validate_location(request: LocationValidationRequest):
                         "scan_errors": 0,
                     },
                     "remote_source": model_remote.get("remote_source", {}) if model_remote else {},
+                    "requested_aoi": aoi,
+                    "model_patch_aoi": model_remote.get("model_patch_aoi", {}) if model_remote else {},
                     "prediction": model_remote if model_remote else {},
                 }
                 if model_remote
@@ -930,12 +927,7 @@ async def validate_location(request: LocationValidationRequest):
             "validation_source": "esa_worldcover",
             "provider": request.provider,
         },
-        "aoi": (
-            model_result.get("aoi", {})
-            if model_result
-            else aoi if model_remote_grid
-            else model_remote.get("aoi", {}) if model_remote else aoi
-        ),
+        "aoi": aoi,
         "calibration": calibration,
         "model": (
             {
@@ -972,6 +964,8 @@ async def validate_location(request: LocationValidationRequest):
                     "scan_errors": 0,
                 },
                 "remote_source": model_remote.get("remote_source", {}) if model_remote else {},
+                "requested_aoi": aoi,
+                "model_patch_aoi": model_remote.get("model_patch_aoi", {}) if model_remote else {},
                 "prediction": model_remote if model_remote else {},
             }
             if model_remote

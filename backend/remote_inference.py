@@ -263,15 +263,16 @@ def run_remote_inference_planetary_computer(
         "search_date_range": {"start": start_date, "end": end_date},
         "cloud_cover_max": cloud_cover_max,
     }
-    result["aoi"] = {
+    result["model_patch_aoi"] = {
         "west": round(west, 6),
         "south": round(south, 6),
         "east": round(east, 6),
         "north": round(north, 6),
         "center_lat": round(lat, 6),
         "center_lon": round(lon, 6),
-        "radius_km": radius_km,
+        "radius_km": patch_radius,
     }
+    result["requested_radius_km"] = radius_km
     return result
 
 
