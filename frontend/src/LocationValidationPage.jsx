@@ -36,6 +36,7 @@ const DEFAULT_FORM = {
   crown_max_candidates: 5000,
   crown_align_with_model: true,
   include_pitch_visuals: false,
+  representative_imagery_source: 'naip',
 };
 
 function fmtNum(v, digits = 1) {
@@ -56,6 +57,19 @@ function TextField({ label, value, onChange, type = 'text', step, min, max }) {
         max={max}
         onChange={(e) => onChange(e.target.value)}
       />
+    </label>
+  );
+}
+
+function SelectField({ label, value, onChange, options }) {
+  return (
+    <label style={styles.field}>
+      <span style={styles.label}>{label}</span>
+      <select style={styles.input} value={value} onChange={(e) => onChange(e.target.value)}>
+        {options.map((option) => (
+          <option key={option.value} value={option.value}>{option.label}</option>
+        ))}
+      </select>
     </label>
   );
 }
@@ -272,6 +286,7 @@ export default function LocationValidationPage() {
       crown_max_candidates: Number(form.crown_max_candidates),
       crown_align_with_model: Boolean(form.crown_align_with_model),
       include_pitch_visuals: Boolean(form.include_pitch_visuals),
+      representative_imagery_source: form.representative_imagery_source,
     };
 
     try {
@@ -399,6 +414,16 @@ export default function LocationValidationPage() {
             <TextField label="NDVI Threshold" value={form.crown_ndvi_threshold} onChange={(v) => setField('crown_ndvi_threshold', v)} type="number" step="0.01" min={-1} max={1} />
             <TextField label="Min Crown Area (px)" value={form.crown_min_area_px} onChange={(v) => setField('crown_min_area_px', v)} type="number" step="1" min={1} />
             <TextField label="Max Candidates" value={form.crown_max_candidates} onChange={(v) => setField('crown_max_candidates', v)} type="number" step="1" min={1} />
+            <SelectField
+              label="Representative Imagery"
+              value={form.representative_imagery_source}
+              onChange={(v) => setField('representative_imagery_source', v)}
+              options={[
+                { value: 'naip', label: 'NAIP Only' },
+                { value: 'auto', label: 'Auto Fallback' },
+                { value: 'sentinel', label: 'Sentinel Only' },
+              ]}
+            />
 
             <label style={{ ...styles.field, display: 'flex', gap: 8, alignItems: 'center', marginTop: 6 }}>
               <input

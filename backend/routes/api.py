@@ -165,6 +165,7 @@ class LocationValidationWithCrownsRequest(LocationValidationRequest):
     crown_align_with_model: bool = True
     crown_max_candidates: int = 5000
     include_pitch_visuals: bool = False
+    representative_imagery_source: str = "auto"
 
 
 def _validate_dataset_structure(dataset_path: str):
@@ -533,9 +534,14 @@ def _build_pitch_regions(
             side_meters = request.crown_radius_km * 2000
             pixels = int(min(1024, max(64, side_meters / 10.0)))
             out_shape = (pixels, pixels)
+            temp_tif = None
             try:
-                imagery_source = "naip"
-                try:
+                preferred_source = (request.representative_imagery_source or "auto").strip().lower()
+                if preferred_source not in {"auto", "naip", "sentinel"}:
+                    raise ValueError("representative_imagery_source must be one of: auto, naip, sentinel")
+                imagery_source = preferred_source
+
+                if preferred_source == "naip":
                     naip_arr, metadata = fetch_remote_naip_visual_planetary_computer(
                         lat=rep["patch_aoi"]["center_lat"],
                         lon=rep["patch_aoi"]["center_lon"],
@@ -544,8 +550,9 @@ def _build_pitch_regions(
                         radius_km=request.crown_radius_km,
                         out_shape=out_shape,
                     )
+                    imagery_source = "naip"
                     temp_tif = _write_array_to_tiff(naip_arr, metadata, prefix=f"pitch_{bucket}_naip_")
-                except Exception:
+                elif preferred_source == "sentinel":
                     imagery_source = "sentinel"
                     tensor, metadata = fetch_remote_tensor_planetary_computer(
                         lat=rep["patch_aoi"]["center_lat"],
@@ -557,6 +564,30 @@ def _build_pitch_regions(
                         out_shape=out_shape,
                     )
                     temp_tif = _write_remote_tensor_to_tiff(tensor, metadata, prefix=f"pitch_{bucket}_sentinel_")
+                else:
+                    try:
+                        naip_arr, metadata = fetch_remote_naip_visual_planetary_computer(
+                            lat=rep["patch_aoi"]["center_lat"],
+                            lon=rep["patch_aoi"]["center_lon"],
+                            start_date=request.start_date,
+                            end_date=request.end_date,
+                            radius_km=request.crown_radius_km,
+                            out_shape=out_shape,
+                        )
+                        imagery_source = "naip"
+                        temp_tif = _write_array_to_tiff(naip_arr, metadata, prefix=f"pitch_{bucket}_naip_")
+                    except Exception:
+                        imagery_source = "sentinel"
+                        tensor, metadata = fetch_remote_tensor_planetary_computer(
+                            lat=rep["patch_aoi"]["center_lat"],
+                            lon=rep["patch_aoi"]["center_lon"],
+                            start_date=request.start_date,
+                            end_date=request.end_date,
+                            radius_km=request.crown_radius_km,
+                            cloud_cover_max=request.cloud_cover_max,
+                            out_shape=out_shape,
+                        )
+                        temp_tif = _write_remote_tensor_to_tiff(tensor, metadata, prefix=f"pitch_{bucket}_sentinel_")
                 model_target_count = None
                 if request.crown_align_with_model:
                     crown_area_ha = (np.pi * (float(request.crown_radius_km) ** 2)) * 100.0
@@ -575,13 +606,18 @@ def _build_pitch_regions(
                 crown_result["imagery_source"] = imagery_source
                 rep["crown_annotation"] = crown_result
             except Exception as e:
-                rep["crown_annotation"] = {"status": "error", "detail": str(e)}
+                rep["crown_annotation"] = {
+                    "status": "error",
+                    "detail": str(e),
+                    "imagery_source": (request.representative_imagery_source or "auto").strip().lower(),
+                }
             finally:
                 if "temp_tif" in locals() and os.path.exists(temp_tif):
                     try:
                         os.remove(temp_tif)
                     except OSError:
                         pass
+                temp_tif = None
 
         representatives.append(rep)
 

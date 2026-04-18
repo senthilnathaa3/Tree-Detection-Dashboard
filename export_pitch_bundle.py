@@ -175,6 +175,8 @@ def build_payload(args: argparse.Namespace) -> Dict[str, Any]:
         "crown_min_area_px": args.crown_min_area_px,
         "crown_max_candidates": args.crown_max_candidates,
         "crown_align_with_model": args.crown_align_with_model,
+        "include_pitch_visuals": args.include_pitch_visuals,
+        "representative_imagery_source": args.representative_imagery_source,
     }
 
 
@@ -203,6 +205,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--crown-align-with-model", dest="crown_align_with_model", action="store_true")
     parser.add_argument("--no-crown-align-with-model", dest="crown_align_with_model", action="store_false")
     parser.set_defaults(crown_align_with_model=True)
+    parser.add_argument("--include-pitch-visuals", action="store_true", default=False)
+    parser.add_argument("--representative-imagery-source", default="naip", choices=["auto", "naip", "sentinel"])
     parser.add_argument("--timeout", type=int, default=1800)
     return parser.parse_args()
 
