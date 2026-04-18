@@ -237,6 +237,7 @@ def run_remote_inference_planetary_computer(
     tensor = _build_15ch_tensor_from_items(items, west, south, east, north, out_shape=(64, 64))
 
     model, device = ModelSingleton.get_model()
+    model.eval()
     tensor = tensor.to(device)
 
     with torch.no_grad():
@@ -361,6 +362,7 @@ def run_remote_inference_planetary_computer_grid(
 
     pts = _grid_points(lat, lon, radius_km=radius_km, grid_size=grid_size)
     model, device = ModelSingleton.get_model()
+    model.eval()
 
     per_point: List[Dict[str, Any]] = []
     failures = 0

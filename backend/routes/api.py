@@ -4,7 +4,9 @@ Handles upload, predict, preview, batch, dataset analysis, and biodiversity endp
 """
 
 import os
+import io
 import json
+import base64
 import asyncio
 import tempfile
 from typing import Optional
@@ -14,6 +16,7 @@ from fastapi import APIRouter, UploadFile, File, HTTPException, Query, Backgroun
 from fastapi.responses import FileResponse, JSONResponse
 from pydantic import BaseModel
 from rasterio.transform import from_bounds as transform_from_bounds
+from PIL import Image, ImageDraw
 
 from ..inference import (
     run_inference,
@@ -258,6 +261,226 @@ def _write_remote_tensor_to_tiff(tensor, metadata: dict, prefix: str = "remote_t
     with rasterio.open(out_path, "w", **profile) as dst:
         dst.write(arr)
     return out_path
+
+
+def _annotated_rgb_png_data_url(tif_path: str, detections: list[dict], max_detections: int = 80) -> str:
+    with rasterio.open(tif_path) as src:
+        arr = src.read().astype(np.float32)
+
+    if arr.shape[0] < 4:
+        raise ValueError("GeoTIFF does not contain enough bands for RGB rendering.")
+
+    rgb = np.stack([arr[3], arr[2], arr[1]], axis=-1)
+    p2 = np.percentile(rgb, 2)
+    p98 = np.percentile(rgb, 98)
+    rgb = np.clip((rgb - p2) / (max(1e-6, p98 - p2)), 0.0, 1.0)
+    image = Image.fromarray((rgb * 255).astype(np.uint8))
+    draw = ImageDraw.Draw(image)
+
+    for det in detections[:max_detections]:
+        bbox = det.get("bbox_px", {})
+        if not bbox:
+            continue
+        x0 = int(bbox.get("xmin", 0))
+        y0 = int(bbox.get("ymin", 0))
+        x1 = int(bbox.get("xmax", 0))
+        y1 = int(bbox.get("ymax", 0))
+        draw.rectangle([x0, y0, x1, y1], outline=(102, 255, 102), width=2)
+        centroid = det.get("centroid_px")
+        if centroid:
+            cx = int(round(float(centroid.get("x", 0))))
+            cy = int(round(float(centroid.get("y", 0))))
+            draw.ellipse([cx - 2, cy - 2, cx + 2, cy + 2], fill=(255, 84, 84))
+
+    buf = io.BytesIO()
+    image.save(buf, format="PNG")
+    encoded = base64.b64encode(buf.getvalue()).decode("ascii")
+    return f"data:image/png;base64,{encoded}"
+
+
+def _summarize_fia_patch(
+    fia_records: Optional[list[dict]],
+    patch_aoi: dict,
+    year_start: Optional[int],
+    year_end: Optional[int],
+) -> dict:
+    if not fia_records or not patch_aoi:
+        return {
+            "available": False,
+            "plots_in_patch": 0,
+            "trees_per_hectare": None,
+            "note": "No FIA source available for patch-level cross-check.",
+        }
+
+    records = filter_fia_records(
+        fia_records,
+        west=patch_aoi["west"],
+        south=patch_aoi["south"],
+        east=patch_aoi["east"],
+        north=patch_aoi["north"],
+        year_start=year_start,
+        year_end=year_end,
+    )
+    summary = summarize_fia(records)
+    tph = summary.get("trees_per_hectare", {}).get("mean")
+    return {
+        "available": bool(records),
+        "plots_in_patch": len(records),
+        "trees_per_hectare": tph,
+        "summary": summary,
+        "note": (
+            "Patch-level FIA support is sparse; use AOI FIA as primary benchmark."
+            if len(records) < 3 else
+            "Patch-level FIA comparison available."
+        ),
+    }
+
+
+def _build_pitch_regions(
+    request: LocationValidationWithCrownsRequest,
+    validation: dict,
+    fia_loaded: Optional[dict],
+) -> Optional[dict]:
+    remote_grid = validation.get("model", {}).get("remote_grid", {})
+    per_point = remote_grid.get("per_point_predictions") or []
+    if not per_point:
+        return None
+
+    calibration = validation.get("calibration") or {}
+    slope = calibration.get("slope")
+    intercept = calibration.get("intercept")
+    has_calibration = slope is not None and intercept is not None
+    if not has_calibration:
+        return {
+            "status": "not_available",
+            "reason": "Calibration required for high/medium/low pitch regions.",
+        }
+
+    enriched = []
+    for idx, point in enumerate(per_point):
+        raw_tph = float(point.get("trees_per_hectare", 0.0))
+        cal_tph = apply_linear_tph_calibration(raw_tph, float(slope), float(intercept))
+        patch_area_ha = float(point.get("patch_area_hectares", 4.0))
+        patch_aoi = point.get("remote_source", {}).get("aoi", {})
+        patch_fia = _summarize_fia_patch(
+            fia_loaded["records"] if fia_loaded else None,
+            patch_aoi,
+            request.year_start,
+            request.year_end,
+        )
+        enriched.append(
+            {
+                "patch_id": point.get("filename", f"grid_{idx:03d}"),
+                "patch_index": idx,
+                "raw_tph": round(raw_tph, 4),
+                "calibrated_tph": round(cal_tph, 4),
+                "patch_tree_count_calibrated": round(cal_tph * patch_area_ha, 2),
+                "patch_area_hectares": patch_area_ha,
+                "dominant_species": point.get("dominant_species"),
+                "dominant_confidence": point.get("dominant_confidence"),
+                "remote_source": point.get("remote_source", {}),
+                "patch_aoi": patch_aoi,
+                "fia_local": patch_fia,
+            }
+        )
+
+    values = np.array([p["calibrated_tph"] for p in enriched], dtype=np.float64)
+    low_cut = float(np.quantile(values, 1 / 3))
+    high_cut = float(np.quantile(values, 2 / 3))
+    if low_cut == high_cut:
+        low_cut = float(np.min(values))
+        high_cut = float(np.max(values))
+
+    for patch in enriched:
+        tph = patch["calibrated_tph"]
+        if tph <= low_cut:
+            bucket = "low"
+        elif tph >= high_cut:
+            bucket = "high"
+        else:
+            bucket = "medium"
+        patch["density_bucket"] = bucket
+
+    grouped = {
+        "high": [p for p in enriched if p["density_bucket"] == "high"],
+        "medium": [p for p in enriched if p["density_bucket"] == "medium"],
+        "low": [p for p in enriched if p["density_bucket"] == "low"],
+    }
+
+    representatives = []
+    for bucket in ["high", "medium", "low"]:
+        group = grouped[bucket]
+        if not group:
+            continue
+        selected = sorted(group, key=lambda item: item["calibrated_tph"], reverse=(bucket == "high"))
+        rep = selected[0] if bucket != "medium" else selected[len(selected) // 2]
+        side_meters = request.crown_radius_km * 2000
+        pixels = int(min(1024, max(64, side_meters / 10.0)))
+        out_shape = (pixels, pixels)
+        try:
+            tensor, metadata = fetch_remote_tensor_planetary_computer(
+                lat=rep["patch_aoi"]["center_lat"],
+                lon=rep["patch_aoi"]["center_lon"],
+                start_date=request.start_date,
+                end_date=request.end_date,
+                radius_km=request.crown_radius_km,
+                cloud_cover_max=request.cloud_cover_max,
+                out_shape=out_shape,
+            )
+            temp_tif = _write_remote_tensor_to_tiff(tensor, metadata, prefix=f"pitch_{bucket}_")
+            model_target_count = None
+            if request.crown_align_with_model:
+                crown_area_ha = (np.pi * (float(request.crown_radius_km) ** 2)) * 100.0
+                model_target_count = rep["calibrated_tph"] * crown_area_ha
+            crown_result = detect_tree_crowns_advanced(
+                tif_path=temp_tif,
+                ndvi_threshold=request.crown_ndvi_threshold,
+                min_area_px=request.crown_min_area_px,
+                model_tree_count=model_target_count,
+                max_candidates=request.crown_max_candidates,
+                include_geojson=True,
+            )
+            annotated_png = _annotated_rgb_png_data_url(temp_tif, crown_result.get("detections", []))
+            crown_result["annotated_image_data_url"] = annotated_png
+            crown_result["remote_source"] = metadata
+            rep["crown_annotation"] = crown_result
+        except Exception as e:
+            rep["crown_annotation"] = {"status": "error", "detail": str(e)}
+        finally:
+            if "temp_tif" in locals() and os.path.exists(temp_tif):
+                try:
+                    os.remove(temp_tif)
+                except OSError:
+                    pass
+
+        representatives.append(rep)
+
+    summary = {}
+    for bucket, items in grouped.items():
+        if not items:
+            summary[bucket] = {"count": 0, "mean_calibrated_tph": None}
+            continue
+        summary[bucket] = {
+            "count": len(items),
+            "mean_calibrated_tph": round(float(np.mean([x["calibrated_tph"] for x in items])), 4),
+            "mean_patch_tree_count": round(float(np.mean([x["patch_tree_count_calibrated"] for x in items])), 4),
+        }
+
+    return {
+        "status": "success",
+        "thresholds": {
+            "low_upper": round(low_cut, 4),
+            "medium_upper": round(high_cut, 4),
+        },
+        "summary": summary,
+        "buckets": grouped,
+        "representatives": representatives,
+        "notes": [
+            "High/medium/low regions are based on calibrated patch TPH quantiles within the AOI.",
+            "Patch-local FIA is shown only when FIA plots fall inside that sampled patch.",
+            "AOI-level FIA remains the primary validation benchmark.",
+        ],
+    }
 
 
 # ─── Browse Server Directories ──────────────────────────────────────────
@@ -1007,6 +1230,12 @@ async def validate_location_crowns(request: LocationValidationWithCrownsRequest)
 
     validation_request = LocationValidationRequest(**base_payload)
     validation = await validate_location(validation_request)
+    fia_loaded = None
+    if request.validation_source.strip().lower() == "fia" and request.fia_csv_path:
+        try:
+            fia_loaded = load_fia_csv(request.fia_csv_path)
+        except Exception:
+            fia_loaded = None
 
     if not request.start_date or not request.end_date:
         return {
@@ -1065,10 +1294,13 @@ async def validate_location_crowns(request: LocationValidationWithCrownsRequest)
             except OSError:
                 pass
 
+    pitch_regions = _build_pitch_regions(request, validation, fia_loaded)
+
     return {
         "status": "success",
         "validation": validation,
         "crowns": crowns,
+        "pitch_regions": pitch_regions,
     }
 
 

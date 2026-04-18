@@ -88,6 +88,36 @@ function Kpi({ title, value, subtitle, tone = '#3b82f6' }) {
   );
 }
 
+function RepresentativeCard({ title, patch }) {
+  const crown = patch?.crown_annotation || {};
+  const localFia = patch?.fia_local || {};
+  return (
+    <section style={styles.card}>
+      <div style={styles.repHeader}>
+        <div>
+          <div style={styles.sectionTitle}>{title}</div>
+          <div style={styles.smallText}>
+            Patch {patch?.patch_id || '—'} · {fmtNum(patch?.calibrated_tph, 1)} TPH calibrated
+          </div>
+        </div>
+        <div style={styles.bucketChip}>{patch?.density_bucket || '—'}</div>
+      </div>
+      {crown?.annotated_image_data_url ? (
+        <img src={crown.annotated_image_data_url} alt={`${title} crown annotation`} style={styles.repImage} />
+      ) : (
+        <div style={styles.smallText}>Annotated crown image unavailable.</div>
+      )}
+      <div style={styles.repFacts}>
+        <div><strong>Patch Trees</strong><span>{fmtNum(patch?.patch_tree_count_calibrated, 1)}</span></div>
+        <div><strong>Dominant Species</strong><span>{patch?.dominant_species || '—'}</span></div>
+        <div><strong>Crown Candidates</strong><span>{fmtNum(crown?.candidate_count, 0)}</span></div>
+        <div><strong>Local FIA TPH</strong><span>{fmtNum(localFia?.trees_per_hectare, 1)}</span></div>
+      </div>
+      <div style={styles.smallText}>{localFia?.note || 'AOI FIA is the primary benchmark for this pitch.'}</div>
+    </section>
+  );
+}
+
 function PathPickerModal({ state, onClose, onOpenPath, onPickPath }) {
   if (!state.open) return null;
   return (
@@ -137,6 +167,7 @@ export default function LocationValidationPage() {
   const [error, setError] = useState('');
   const [validation, setValidation] = useState(null);
   const [crowns, setCrowns] = useState(null);
+  const [pitchRegions, setPitchRegions] = useState(null);
   const [lastSavedAt, setLastSavedAt] = useState('');
   const [showSidebar, setShowSidebar] = useState(true);
 
@@ -160,6 +191,7 @@ export default function LocationValidationPage() {
       if (parsed?.form) setForm((prev) => ({ ...prev, ...parsed.form }));
       if (parsed?.validation) setValidation(parsed.validation);
       if (parsed?.crowns) setCrowns(parsed.crowns);
+      if (parsed?.pitch_regions) setPitchRegions(parsed.pitch_regions);
       if (parsed?.saved_at) setLastSavedAt(parsed.saved_at);
       setShowSidebar(false);
     } catch {
@@ -233,11 +265,18 @@ export default function LocationValidationPage() {
       const out = await validateLocationWithCrowns(payload);
       setValidation(out?.validation || null);
       setCrowns(out?.crowns || null);
+      setPitchRegions(out?.pitch_regions || null);
       const savedAt = new Date().toISOString();
       setLastSavedAt(savedAt);
       window.localStorage.setItem(
         LAST_RUN_STORAGE_KEY,
-        JSON.stringify({ saved_at: savedAt, form, validation: out?.validation || null, crowns: out?.crowns || null }),
+        JSON.stringify({
+          saved_at: savedAt,
+          form,
+          validation: out?.validation || null,
+          crowns: out?.crowns || null,
+          pitch_regions: out?.pitch_regions || null,
+        }),
       );
     } catch (err) {
       setError(err.message || 'Run failed');
@@ -254,19 +293,37 @@ export default function LocationValidationPage() {
   const metrics = useMemo(() => {
     if (!validation) return null;
     const cal = validation?.comparison?.density_agreement_calibrated || null;
-    const fia = cal?.fia_mean_trees_per_hectare ?? validation?.comparison?.density_agreement?.fia_mean_trees_per_hectare ?? null;
+    const fia = cal?.fia_mean_trees_per_hectare ?? null;
     const tphCal = cal?.model_tph_calibrated ?? null;
     const pct = cal?.percent_difference ?? null;
     const agreement = pct === null || pct === undefined ? null : Math.max(0, 100 - Math.abs(Number(pct)));
     const crownCount = crowns?.candidate_count ?? null;
+    const totalPatches = validation?.model?.summary?.total_tiles_analyzed ?? null;
 
     const chartData = [
       { metric: 'Model TPH (Cal)', value: tphCal, fill: '#22d3ee' },
       { metric: 'FIA TPH', value: fia, fill: '#34d399' },
     ].filter((x) => x.value !== null && x.value !== undefined);
 
-    return { tphCal, fia, pct, agreement, crownCount, chartData };
-  }, [validation, crowns]);
+    const hasCalibration = tphCal !== null && tphCal !== undefined && fia !== null && fia !== undefined;
+    const regionChartData = pitchRegions?.summary
+      ? [
+          { metric: 'High', value: pitchRegions.summary.high?.mean_calibrated_tph, fill: '#f97316' },
+          { metric: 'Medium', value: pitchRegions.summary.medium?.mean_calibrated_tph, fill: '#facc15' },
+          { metric: 'Low', value: pitchRegions.summary.low?.mean_calibrated_tph, fill: '#22c55e' },
+        ].filter((x) => x.value !== null && x.value !== undefined)
+      : [];
+    return { tphCal, fia, pct, agreement, crownCount, totalPatches, chartData, hasCalibration, regionChartData };
+  }, [validation, crowns, pitchRegions]);
+
+  const representativeByBucket = useMemo(() => {
+    const reps = pitchRegions?.representatives || [];
+    return {
+      high: reps.find((x) => x.density_bucket === 'high') || null,
+      medium: reps.find((x) => x.density_bucket === 'medium') || null,
+      low: reps.find((x) => x.density_bucket === 'low') || null,
+    };
+  }, [pitchRegions]);
 
   return (
     <div style={styles.page}>
@@ -349,7 +406,7 @@ export default function LocationValidationPage() {
         <main style={styles.main}>
           {error ? <div style={styles.error}>{error}</div> : null}
 
-          {metrics ? (
+          {metrics?.hasCalibration ? (
             <>
               <section style={styles.card}>
                 <div style={styles.sectionTitle}>Pitch KPIs (Calibrated Only)</div>
@@ -357,12 +414,12 @@ export default function LocationValidationPage() {
                   <Kpi title="Agreement Score" value={metrics.agreement === null ? '—' : `${fmtNum(metrics.agreement, 2)}%`} subtitle="100 - |calibrated % diff|" tone="#a78bfa" />
                   <Kpi title="Model TPH (Calibrated)" value={fmtNum(metrics.tphCal, 2)} subtitle="Trees/hectare" tone="#22d3ee" />
                   <Kpi title="FIA TPH" value={fmtNum(metrics.fia, 2)} subtitle="AOI reference" tone="#34d399" />
-                  <Kpi title="Crown Candidates" value={fmtNum(metrics.crownCount, 0)} subtitle="Object-level crowns" tone="#f59e0b" />
+                  <Kpi title="AOI Patches" value={fmtNum(metrics.totalPatches, 0)} subtitle="Grid samples analyzed" tone="#f97316" />
                 </div>
               </section>
 
               <section style={styles.card}>
-                <div style={styles.sectionTitle}>TPH Comparison</div>
+                <div style={styles.sectionTitle}>AOI TPH vs FIA</div>
                 <ResponsiveContainer width="100%" height={280}>
                   <BarChart data={metrics.chartData} margin={{ top: 10, right: 16, left: 0, bottom: 8 }}>
                     <CartesianGrid strokeDasharray="3 3" stroke="rgba(148,163,184,0.25)" />
@@ -382,38 +439,50 @@ export default function LocationValidationPage() {
                 </ResponsiveContainer>
               </section>
 
-              {crowns?.detections?.length ? (
+              {pitchRegions?.status === 'success' ? (
                 <section style={styles.card}>
-                  <div style={styles.sectionTitle}>Top Crown Detections</div>
-                  <div style={styles.tableWrap}>
-                    <table style={styles.table}>
-                      <thead>
-                        <tr>
-                          <th>#</th>
-                          <th>Score</th>
-                          <th>Area(px)</th>
-                          <th>Centroid(px)</th>
-                          <th>BBox(px)</th>
-                        </tr>
-                      </thead>
-                      <tbody>
-                        {crowns.detections.slice(0, 20).map((d, i) => (
-                          <tr key={`${d.crown_id || i}-${d.score}`}>
-                            <td>{i + 1}</td>
-                            <td>{fmtNum(d.score, 3)}</td>
-                            <td>{fmtNum(d.area_px, 0)}</td>
-                            <td>{fmtNum(d.centroid_px?.x, 1)}, {fmtNum(d.centroid_px?.y, 1)}</td>
-                            <td>{d.bbox_px?.xmin},{d.bbox_px?.ymin} {' -> '} {d.bbox_px?.xmax},{d.bbox_px?.ymax}</td>
-                          </tr>
-                        ))}
-                      </tbody>
-                    </table>
+                  <div style={styles.sectionTitle}>Density Regions</div>
+                  <div style={styles.kpiGrid}>
+                    <Kpi title="High Density" value={fmtNum(pitchRegions.summary?.high?.mean_calibrated_tph, 1)} subtitle={`${fmtNum(pitchRegions.summary?.high?.count, 0)} patches`} tone="#f97316" />
+                    <Kpi title="Medium Density" value={fmtNum(pitchRegions.summary?.medium?.mean_calibrated_tph, 1)} subtitle={`${fmtNum(pitchRegions.summary?.medium?.count, 0)} patches`} tone="#facc15" />
+                    <Kpi title="Low Density" value={fmtNum(pitchRegions.summary?.low?.mean_calibrated_tph, 1)} subtitle={`${fmtNum(pitchRegions.summary?.low?.count, 0)} patches`} tone="#22c55e" />
+                    <Kpi title="Crown Candidates" value={fmtNum(metrics.crownCount, 0)} subtitle="Overview patch crowns" tone="#38bdf8" />
                   </div>
+                </section>
+              ) : null}
+
+              {metrics.regionChartData?.length ? (
+                <section style={styles.card}>
+                  <div style={styles.sectionTitle}>Region Mean TPH</div>
+                  <ResponsiveContainer width="100%" height={260}>
+                    <BarChart data={metrics.regionChartData} margin={{ top: 10, right: 16, left: 0, bottom: 8 }}>
+                      <CartesianGrid strokeDasharray="3 3" stroke="rgba(148,163,184,0.25)" />
+                      <XAxis dataKey="metric" tick={{ fill: 'var(--text-muted)', fontSize: 12 }} />
+                      <YAxis tick={{ fill: 'var(--text-muted)', fontSize: 12 }} />
+                      <Tooltip contentStyle={{ backgroundColor: 'var(--bg-elevated)', border: '1px solid var(--border-color)', boxShadow: 'none' }} />
+                      <Bar dataKey="value" radius={[8, 8, 0, 0]}>
+                        {metrics.regionChartData.map((e) => <Cell key={e.metric} fill={e.fill} />)}
+                      </Bar>
+                    </BarChart>
+                  </ResponsiveContainer>
+                </section>
+              ) : null}
+
+              {(representativeByBucket.high || representativeByBucket.medium || representativeByBucket.low) ? (
+                <section style={styles.repGrid}>
+                  {representativeByBucket.high ? <RepresentativeCard title="High Density Patch" patch={representativeByBucket.high} /> : null}
+                  {representativeByBucket.medium ? <RepresentativeCard title="Medium Density Patch" patch={representativeByBucket.medium} /> : null}
+                  {representativeByBucket.low ? <RepresentativeCard title="Low Density Patch" patch={representativeByBucket.low} /> : null}
                 </section>
               ) : null}
             </>
           ) : (
-            <section style={styles.card}><div style={styles.smallText}>Run once to populate pitch metrics.</div></section>
+            <section style={styles.card}>
+              <div style={styles.smallText}>
+                Calibrated metrics are hidden until calibration is available.
+                Provide `calibration_profile_path` and `calibration_region`, then run again.
+              </div>
+            </section>
           )}
         </main>
       </div>
@@ -536,6 +605,31 @@ const styles = {
   tableWrap: { overflowX: 'auto', border: '1px solid var(--border-color)', borderRadius: 10 },
   table: { width: '100%', borderCollapse: 'collapse', fontSize: '0.8rem' },
   smallText: { color: 'var(--text-muted)', fontSize: '0.8rem' },
+  repGrid: { display: 'grid', gridTemplateColumns: 'repeat(auto-fit,minmax(300px,1fr))', gap: 14 },
+  repHeader: { display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start', gap: 10 },
+  bucketChip: {
+    border: '1px solid var(--border-color)',
+    background: 'var(--bg-elevated)',
+    borderRadius: 999,
+    padding: '4px 9px',
+    textTransform: 'uppercase',
+    fontSize: '0.68rem',
+    color: 'var(--text-secondary)',
+    letterSpacing: '0.05em',
+  },
+  repImage: {
+    width: '100%',
+    aspectRatio: '1 / 1',
+    objectFit: 'cover',
+    borderRadius: 10,
+    border: '1px solid var(--border-color)',
+    background: 'var(--bg-elevated)',
+  },
+  repFacts: {
+    display: 'grid',
+    gridTemplateColumns: '1fr 1fr',
+    gap: 8,
+  },
   modalOverlay: {
     position: 'fixed',
     inset: 0,

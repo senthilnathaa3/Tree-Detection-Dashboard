@@ -157,6 +157,7 @@ def run_inference(file_path: str, species_threshold: float = 0.5) -> Dict[str, A
         Dictionary containing all predictions and computed metrics
     """
     model, device = ModelSingleton.get_model()
+    model.eval()
     tensor = preprocess_tif(file_path)
     tensor = tensor.to(device)
 
@@ -230,6 +231,7 @@ def run_inference_paired(
     Run inference on paired S2 + S1 files.
     """
     model, device = ModelSingleton.get_model()
+    model.eval()
     tensor = preprocess_paired_s1_s2(s2_path, s1_path)
     tensor = tensor.to(device)
 
@@ -369,6 +371,7 @@ def batch_inference(
         List of result dictionaries, one per file pair
     """
     model, device = ModelSingleton.get_model()
+    model.eval()
     pairs = discover_dataset(dataset_path)
     total = len(pairs)
     all_results = []
