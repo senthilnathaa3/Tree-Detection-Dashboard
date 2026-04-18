@@ -21,7 +21,7 @@ import json
 import os
 import time
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
@@ -113,11 +113,15 @@ class LocalPairedDataset(Dataset):
         labels_csv: str,
         density_target_mode: str = "tph",
         tph_reference: float = 1000.0,
+        tph_min: Optional[float] = None,
+        tph_max: Optional[float] = None,
     ):
         self.pairs = discover_dataset(dataset_path)
         self.by_filename = {os.path.basename(s2): (s2, s1) for s2, s1 in self.pairs}
         self.density_target_mode = (density_target_mode or "tph").strip().lower()
         self.tph_reference = float(tph_reference)
+        self.tph_min = float(tph_min) if tph_min is not None else None
+        self.tph_max = float(tph_max) if tph_max is not None else None
         self.labels = self._load_labels(labels_csv)
         self.keys = sorted(set(self.by_filename.keys()) & set(self.labels.keys()))
 
@@ -182,6 +186,10 @@ class LocalPairedDataset(Dataset):
                 if label.tph is not None
                 else float(label.density or 0.0) * self.tph_reference
             )
+            if self.tph_min is not None or self.tph_max is not None:
+                lo = self.tph_min if self.tph_min is not None else -np.inf
+                hi = self.tph_max if self.tph_max is not None else np.inf
+                target = float(np.clip(target, lo, hi))
         else:
             target = (
                 float(label.density)
@@ -219,6 +227,8 @@ class AOISampleDataset(Dataset):
         cache_dir: Optional[str] = None,
         density_target_mode: str = "tph",
         tph_reference: float = 1000.0,
+        tph_min: Optional[float] = None,
+        tph_max: Optional[float] = None,
     ):
         if not os.path.isfile(samples_csv):
             raise FileNotFoundError(f"AOI samples CSV not found: {samples_csv}")
@@ -227,6 +237,8 @@ class AOISampleDataset(Dataset):
         self.default_cloud_cover_max = float(default_cloud_cover_max)
         self.density_target_mode = (density_target_mode or "tph").strip().lower()
         self.tph_reference = float(tph_reference)
+        self.tph_min = float(tph_min) if tph_min is not None else None
+        self.tph_max = float(tph_max) if tph_max is not None else None
         self.cache_dir = cache_dir
         if self.cache_dir:
             os.makedirs(self.cache_dir, exist_ok=True)
@@ -326,6 +338,10 @@ class AOISampleDataset(Dataset):
                 if row.get("tph") is not None
                 else float(row.get("density") or 0.0) * self.tph_reference
             )
+            if self.tph_min is not None or self.tph_max is not None:
+                lo = self.tph_min if self.tph_min is not None else -np.inf
+                hi = self.tph_max if self.tph_max is not None else np.inf
+                target = float(np.clip(target, lo, hi))
         else:
             target = (
                 float(row["density"])
@@ -353,6 +369,7 @@ def run_epoch(
     density_loss_weight: float,
     species_loss_weight: float,
     density_loss_kind: str = "huber",
+    grad_clip_norm: float = 0.0,
 ):
     train_mode = optimizer is not None
     model.train(train_mode)
@@ -389,6 +406,8 @@ def run_epoch(
             loss = density_loss_weight * loss_d + species_loss_weight * loss_s
             if train_mode:
                 loss.backward()
+                if grad_clip_norm and grad_clip_norm > 0:
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), float(grad_clip_norm))
                 optimizer.step()
 
         preds.extend(d_pred.detach().cpu().numpy().reshape(-1).tolist())
@@ -477,7 +496,13 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--species-loss-weight", type=float, default=1.0)
     p.add_argument("--density-target-mode", choices=["normalized", "tph"], default="tph")
     p.add_argument("--tph-reference", type=float, default=1000.0)
+    p.add_argument("--tph-min", type=float, default=None)
+    p.add_argument("--tph-max", type=float, default=None)
     p.add_argument("--density-loss-kind", choices=["huber", "mse", "l1"], default="huber")
+    p.add_argument("--grad-clip-norm", type=float, default=1.0, help="0 to disable gradient clipping")
+    p.add_argument("--best-metric", choices=["val_loss", "val_mape"], default="val_mape")
+    p.add_argument("--early-stop-patience", type=int, default=6)
+    p.add_argument("--early-stop-min-delta", type=float, default=0.0)
     p.add_argument("--holdout-csv", default="", help="Optional holdout CSV (same schema as training mode) for final raw metric report.")
 
     p.add_argument("--output-dir", default="backend/checkpoints/v2")
@@ -490,6 +515,9 @@ def parse_args() -> argparse.Namespace:
 def main() -> int:
     args = parse_args()
 
+    if args.tph_min is not None and args.tph_max is not None and args.tph_min > args.tph_max:
+        raise ValueError("tph_min must be <= tph_max")
+
     torch.manual_seed(args.seed)
     np.random.seed(args.seed)
 
@@ -501,6 +529,8 @@ def main() -> int:
             args.labels_csv,
             density_target_mode=args.density_target_mode,
             tph_reference=args.tph_reference,
+            tph_min=args.tph_min,
+            tph_max=args.tph_max,
         )
     else:
         if not args.aoi_samples_csv:
@@ -512,6 +542,8 @@ def main() -> int:
             cache_dir=args.aoi_cache_dir or None,
             density_target_mode=args.density_target_mode,
             tph_reference=args.tph_reference,
+            tph_min=args.tph_min,
+            tph_max=args.tph_max,
         )
 
     total = len(dataset)
@@ -553,6 +585,8 @@ def main() -> int:
                 args.holdout_csv,
                 density_target_mode=args.density_target_mode,
                 tph_reference=args.tph_reference,
+                tph_min=args.tph_min,
+                tph_max=args.tph_max,
             )
         else:
             holdout_ds = AOISampleDataset(
@@ -562,6 +596,8 @@ def main() -> int:
                 cache_dir=args.aoi_cache_dir or None,
                 density_target_mode=args.density_target_mode,
                 tph_reference=args.tph_reference,
+                tph_min=args.tph_min,
+                tph_max=args.tph_max,
             )
         holdout_loader = DataLoader(
             holdout_ds,
@@ -572,7 +608,8 @@ def main() -> int:
         )
 
     start_epoch = 1
-    best_val = float("inf")
+    best_score = float("inf")
+    no_improve_epochs = 0
 
     if args.resume_checkpoint:
         ckpt = torch.load(args.resume_checkpoint, map_location=device, weights_only=False)
@@ -581,7 +618,7 @@ def main() -> int:
             if "optimizer_state_dict" in ckpt:
                 optimizer.load_state_dict(ckpt["optimizer_state_dict"])
             start_epoch = int(ckpt.get("epoch", 0)) + 1
-            best_val = float(ckpt.get("best_val_loss", best_val))
+            best_score = float(ckpt.get("best_score", ckpt.get("best_val_loss", best_score)))
         else:
             model.load_state_dict(ckpt, strict=False)
 
@@ -607,6 +644,7 @@ def main() -> int:
             density_loss_weight=args.density_loss_weight,
             species_loss_weight=args.species_loss_weight,
             density_loss_kind=args.density_loss_kind,
+            grad_clip_norm=args.grad_clip_norm,
         )
         val_metrics = run_epoch(
             model,
@@ -616,6 +654,7 @@ def main() -> int:
             density_loss_weight=args.density_loss_weight,
             species_loss_weight=args.species_loss_weight,
             density_loss_kind=args.density_loss_kind,
+            grad_clip_norm=0.0,
         )
 
         row = {
@@ -644,30 +683,43 @@ def main() -> int:
             f"val_mae={row['val_mae']:.4f}, val_mape={row['val_mape']:.2f}%)"
         )
 
+        metric_value = row["val_mape"] if args.best_metric == "val_mape" else row["val_loss"]
         checkpoint_payload = {
             "epoch": epoch,
             "model_state_dict": model.state_dict(),
             "optimizer_state_dict": optimizer.state_dict(),
-            "best_val_loss": best_val,
+            "best_score": best_score,
+            "best_metric": args.best_metric,
             "train_metrics": train_metrics,
             "val_metrics": val_metrics,
-            "timestamp_utc": datetime.utcnow().isoformat() + "Z",
+            "timestamp_utc": datetime.now(timezone.utc).isoformat(),
             "model_variant": "v2",
             "density_target_mode": args.density_target_mode,
             "train_config": vars(args),
         }
         save_checkpoint(last_path, checkpoint_payload)
 
-        if row["val_loss"] < best_val:
-            best_val = row["val_loss"]
-            checkpoint_payload["best_val_loss"] = best_val
+        improved = metric_value < (best_score - float(args.early_stop_min_delta))
+        if improved:
+            best_score = metric_value
+            no_improve_epochs = 0
+            checkpoint_payload["best_score"] = best_score
             save_checkpoint(best_path, checkpoint_payload)
-            print(f"  -> new best checkpoint: {best_path} (val={best_val:.6f})")
+            print(f"  -> new best checkpoint: {best_path} ({args.best_metric}={best_score:.6f})")
+        else:
+            no_improve_epochs += 1
 
         with open(history_path, "w", newline="", encoding="utf-8") as f:
             writer = csv.DictWriter(f, fieldnames=list(history_rows[0].keys()))
             writer.writeheader()
             writer.writerows(history_rows)
+
+        if args.early_stop_patience > 0 and no_improve_epochs >= args.early_stop_patience:
+            print(
+                f"Early stopping at epoch {epoch}: no improvement in {args.best_metric} "
+                f"for {no_improve_epochs} epochs."
+            )
+            break
 
     print("Training complete")
     print(f"Best checkpoint: {best_path}")

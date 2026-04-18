@@ -51,6 +51,18 @@ export async function browseDirectory(path = '/') {
     return response.json();
 }
 
+export async function browsePaths(path = '/', includeFiles = false, extensions = []) {
+    const extParam = Array.isArray(extensions) ? extensions.join(',') : '';
+    const response = await fetch(
+        `${API_BASE}/browse-paths?path=${encodeURIComponent(path)}&include_files=${includeFiles ? 'true' : 'false'}&extensions=${encodeURIComponent(extParam)}`
+    );
+    if (!response.ok) {
+        const error = await response.json().catch(() => ({ detail: 'Unknown error' }));
+        throw new Error(error.detail || 'Failed to browse paths');
+    }
+    return response.json();
+}
+
 // ─── Dataset Geographic Bounds ─────────────────────────────────────────
 
 export async function getDatasetBounds(datasetPath) {

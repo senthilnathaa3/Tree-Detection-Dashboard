@@ -56,7 +56,7 @@ from ..calibration import (
     load_calibration_profile,
     pick_calibration_from_profile,
 )
-from ..object_detection import detect_tree_crowns_ndvi
+from ..object_detection import detect_tree_crowns_advanced, detect_tree_crowns_ndvi
 
 router = APIRouter()
 
@@ -273,6 +273,71 @@ async def browse_directory(path: str = Query("/", description="Directory path to
         "is_dataset": has_s1 and has_s2,
         "has_s1": has_s1,
         "has_s2": has_s2,
+    }
+
+
+@router.get("/browse-paths")
+async def browse_paths(
+    path: str = Query("/", description="Directory path to list"),
+    include_files: bool = Query(False, description="Include files in listing"),
+    extensions: str = Query("", description="Comma-separated extensions, e.g. .csv,.json"),
+):
+    """
+    Generic filesystem browser for selecting directories/files from form fields.
+    """
+    if path == "/" or not path:
+        path = os.path.expanduser("~")
+
+    target = os.path.abspath(os.path.expanduser(path))
+    if not os.path.isdir(target):
+        raise HTTPException(status_code=400, detail=f"Not a directory: {target}")
+
+    ext_filter = set()
+    if extensions.strip():
+        for part in extensions.split(","):
+            ext = part.strip().lower()
+            if not ext:
+                continue
+            if not ext.startswith("."):
+                ext = "." + ext
+            ext_filter.add(ext)
+
+    entries = []
+    try:
+        for entry in sorted(os.scandir(target), key=lambda e: e.name.lower()):
+            if entry.name.startswith("."):
+                continue
+
+            if entry.is_dir(follow_symlinks=False):
+                entries.append({
+                    "name": entry.name,
+                    "path": entry.path,
+                    "is_dir": True,
+                    "size_bytes": None,
+                })
+                continue
+
+            if include_files and entry.is_file(follow_symlinks=False):
+                ext = os.path.splitext(entry.name)[1].lower()
+                if ext_filter and ext not in ext_filter:
+                    continue
+                try:
+                    size_bytes = entry.stat().st_size
+                except OSError:
+                    size_bytes = None
+                entries.append({
+                    "name": entry.name,
+                    "path": entry.path,
+                    "is_dir": False,
+                    "size_bytes": size_bytes,
+                })
+    except PermissionError:
+        raise HTTPException(status_code=403, detail=f"Permission denied: {target}")
+
+    return {
+        "current_path": target,
+        "parent_path": os.path.dirname(target),
+        "entries": entries,
     }
 
 

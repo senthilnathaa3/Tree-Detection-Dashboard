@@ -10,7 +10,7 @@ import {
   XAxis,
   YAxis,
 } from 'recharts';
-import { detectCrowns, fetchRemoteGeoTiff, validateLocation } from './services/api';
+import { browsePaths, detectCrowns, fetchRemoteGeoTiff, validateLocation } from './services/api';
 
 const FOREST_PRESET = {
   lat: 38.7,
@@ -66,6 +66,26 @@ function TextInput({ label, value, onChange, placeholder = '' }) {
   );
 }
 
+function PathInput({ label, value, onChange, placeholder = '', onBrowse }) {
+  return (
+    <label style={styles.field}>
+      <span style={styles.label}>{label}</span>
+      <div style={styles.pathInputRow}>
+        <input
+          style={styles.input}
+          type="text"
+          value={value}
+          placeholder={placeholder}
+          onChange={(e) => onChange(e.target.value)}
+        />
+        <button type="button" style={styles.secondaryBtn} onClick={onBrowse}>
+          Browse
+        </button>
+      </div>
+    </label>
+  );
+}
+
 function DateInput({ label, value, onChange }) {
   return (
     <label style={styles.field}>
@@ -100,9 +120,20 @@ export default function LocationValidationPage() {
   const [crownFetchLoading, setCrownFetchLoading] = useState(false);
   const [crownError, setCrownError] = useState('');
   const [crownResult, setCrownResult] = useState(null);
-  const [isDetectionExpanded, setIsDetectionExpanded] = useState(false);
   const [shouldAlignWithModel, setShouldAlignWithModel] = useState(true);
   const [lastRunLoadedAt, setLastRunLoadedAt] = useState('');
+  const [pathPicker, setPathPicker] = useState({
+    open: false,
+    title: '',
+    targetField: '',
+    includeFiles: true,
+    extensions: [],
+    currentPath: '~',
+    parentPath: '',
+    entries: [],
+    loading: false,
+    error: '',
+  });
 
   const isFIA = form.validation_source === 'fia';
 
@@ -150,6 +181,50 @@ export default function LocationValidationPage() {
       // Ignore storage errors.
     }
     setLastRunLoadedAt('');
+  };
+
+  const browsePickerPath = async (path, includeFiles = true, extensions = []) => {
+    setPathPicker((prev) => ({ ...prev, loading: true, error: '' }));
+    try {
+      const data = await browsePaths(path, includeFiles, extensions);
+      setPathPicker((prev) => ({
+        ...prev,
+        currentPath: data.current_path,
+        parentPath: data.parent_path,
+        entries: data.entries || [],
+        loading: false,
+      }));
+    } catch (err) {
+      setPathPicker((prev) => ({ ...prev, loading: false, error: err.message || 'Browse failed' }));
+    }
+  };
+
+  const openPathPicker = (targetField, title, extensions) => {
+    setPathPicker((prev) => ({
+      ...prev,
+      open: true,
+      title,
+      targetField,
+      includeFiles: true,
+      extensions: extensions || [],
+      currentPath: '~',
+      parentPath: '',
+      entries: [],
+      loading: false,
+      error: '',
+    }));
+    browsePickerPath('~', true, extensions || []);
+  };
+
+  const closePathPicker = () => {
+    setPathPicker((prev) => ({ ...prev, open: false }));
+  };
+
+  const selectPathFromPicker = (pickedPath) => {
+    if (pathPicker.targetField) {
+      setField(pathPicker.targetField, pickedPath);
+    }
+    closePathPicker();
   };
 
   useEffect(() => {
@@ -347,6 +422,8 @@ export default function LocationValidationPage() {
         </div>
       ) : null}
 
+      <div style={styles.contentLayout}>
+      <aside style={styles.sidebarPanel}>
       <div style={styles.formCard}>
         {isConfigExpanded && (
           <>
@@ -420,11 +497,12 @@ export default function LocationValidationPage() {
               </div>
               
               <div style={styles.grid2}>
-                <TextInput
+                <PathInput
                   label="Calibration Profile Path"
                   value={form.calibration_profile_path}
                   onChange={(v) => setField('calibration_profile_path', v)}
                   placeholder="/abs/path/regional_calibration.json"
+                  onBrowse={() => openPathPicker('calibration_profile_path', 'Select Calibration Profile', ['.json'])}
                 />
                 <TextInput
                   label="Calibration Region"
@@ -436,11 +514,12 @@ export default function LocationValidationPage() {
 
               {isFIA ? (
                 <>
-                  <TextInput
+                  <PathInput
                     label="FIA CSV Path"
                     value={form.fia_csv_path}
                     onChange={(v) => setField('fia_csv_path', v)}
                     placeholder="/abs/path/to/fia.csv"
+                    onBrowse={() => openPathPicker('fia_csv_path', 'Select FIA CSV', ['.csv'])}
                   />
                   <div style={styles.grid2}>
                     <NumberInput label="Year Start" value={form.year_start} onChange={(v) => setField('year_start', v)} step="1" />
@@ -448,11 +527,12 @@ export default function LocationValidationPage() {
                   </div>
                 </>
               ) : (
-                <TextInput
+                <PathInput
                   label="WorldCover Raster Path"
                   value={form.worldcover_path}
                   onChange={(v) => setField('worldcover_path', v)}
                   placeholder="/abs/path/to/worldcover.tif"
+                  onBrowse={() => openPathPicker('worldcover_path', 'Select WorldCover Raster', ['.tif', '.tiff'])}
                 />
               )}
 
@@ -465,6 +545,8 @@ export default function LocationValidationPage() {
           </>
         )}
       </div>
+      </aside>
+      <main style={styles.mainPanel}>
 
       {error ? <div style={styles.error}>{error}</div> : null}
 
@@ -582,21 +664,10 @@ export default function LocationValidationPage() {
       ) : null}
 
       <section style={{ ...styles.resultCard, marginTop: 40, background: 'rgba(255,255,255,0.01)' }}>
-        <div style={styles.rowBetween}>
-          <div>
-            <h2 style={{ ...styles.h2, margin: 0 }}>Developer Tool: Object Detection</h2>
-            <p style={styles.subtleLine}>NDVI + connected-components baseline for crown candidate detection</p>
-          </div>
-          <button 
-            style={styles.secondaryBtn} 
-            type="button" 
-            onClick={() => setIsDetectionExpanded(!isDetectionExpanded)}
-          >
-            {isDetectionExpanded ? 'Hide Detection Tool' : 'Show Detection Tool'}
-          </button>
+        <div>
+          <h2 style={{ ...styles.h2, margin: 0 }}>TPH + Crown Detection</h2>
+          <p style={styles.subtleLine}>Same pitch run: calibrated TPH benchmark and object-level crown candidates.</p>
         </div>
-
-        {isDetectionExpanded && (
           <div style={{ marginTop: 24, paddingTop: 24, borderTop: '1px solid var(--border-color)' }}>
             <form onSubmit={runCrownDetection} style={styles.crownForm}>
               <div style={styles.fetchBox}>
@@ -727,8 +798,22 @@ export default function LocationValidationPage() {
               </>
             ) : null}
           </div>
-        )}
       </section>
+      </main>
+      </div>
+      {pathPicker.open ? (
+        <PathPickerModal
+          title={pathPicker.title}
+          currentPath={pathPicker.currentPath}
+          parentPath={pathPicker.parentPath}
+          entries={pathPicker.entries}
+          loading={pathPicker.loading}
+          error={pathPicker.error}
+          onClose={closePathPicker}
+          onOpenPath={(p) => browsePickerPath(p, pathPicker.includeFiles, pathPicker.extensions)}
+          onSelectPath={selectPathFromPicker}
+        />
+      ) : null}
     </div>
   );
 }
@@ -747,6 +832,58 @@ function MetricCard({ title, value, subtitle, tone }) {
       <div style={styles.metricTitle}>{title}</div>
       <div style={styles.metricValue}>{value}</div>
       <div style={styles.metricSub}>{subtitle}</div>
+    </div>
+  );
+}
+
+function PathPickerModal({
+  title,
+  currentPath,
+  parentPath,
+  entries,
+  loading,
+  error,
+  onClose,
+  onOpenPath,
+  onSelectPath,
+}) {
+  return (
+    <div style={styles.modalOverlay} onClick={onClose}>
+      <div style={styles.modalCard} onClick={(e) => e.stopPropagation()}>
+        <div style={styles.modalHeader}>
+          <div style={{ fontWeight: 700 }}>{title || 'Select Path'}</div>
+          <button type="button" style={styles.secondaryBtn} onClick={onClose}>Close</button>
+        </div>
+        <div style={styles.modalPathRow}>
+          <button
+            type="button"
+            style={styles.secondaryBtn}
+            onClick={() => onOpenPath(parentPath || currentPath)}
+            disabled={!parentPath || parentPath === currentPath}
+          >
+            Up
+          </button>
+          <div style={styles.modalPathText}>{currentPath}</div>
+        </div>
+        {error ? <div style={styles.errorInline}>{error}</div> : null}
+        <div style={styles.modalList}>
+          {loading ? (
+            <div style={styles.smallNote}>Loading...</div>
+          ) : (
+            entries.map((entry) => (
+              <button
+                type="button"
+                key={entry.path}
+                style={styles.modalEntry}
+                onClick={() => (entry.is_dir ? onOpenPath(entry.path) : onSelectPath(entry.path))}
+              >
+                <span>{entry.is_dir ? '📁' : '📄'}</span>
+                <span>{entry.name}</span>
+              </button>
+            ))
+          )}
+        </div>
+      </div>
     </div>
   );
 }
@@ -803,6 +940,24 @@ const styles = {
     fontSize: '0.75rem',
     fontFamily: 'var(--font-sans)',
   },
+  contentLayout: {
+    maxWidth: 1200,
+    margin: '0 auto',
+    display: 'grid',
+    gridTemplateColumns: '360px 1fr',
+    gap: 20,
+    alignItems: 'start',
+  },
+  sidebarPanel: {
+    position: 'sticky',
+    top: 16,
+    maxHeight: 'calc(100vh - 32px)',
+    overflowY: 'auto',
+    paddingRight: 4,
+  },
+  mainPanel: {
+    minWidth: 0,
+  },
   linkBtn: {
     color: 'var(--text-primary)',
     background: 'var(--bg-elevated)',
@@ -839,6 +994,7 @@ const styles = {
   grid2: { display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(280px, 1fr))', gap: 16 },
   grid3: { display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(240px, 1fr))', gap: 16 },
   field: { display: 'grid', gap: 6 },
+  pathInputRow: { display: 'grid', gridTemplateColumns: '1fr auto', gap: 8, alignItems: 'center' },
   label: { color: 'var(--text-secondary)', fontSize: '0.75rem', fontWeight: 600, textTransform: 'uppercase', letterSpacing: '0.05em' },
   input: {
     background: 'var(--bg-input)',
@@ -1027,5 +1183,70 @@ const styles = {
     borderCollapse: 'collapse',
     fontSize: '0.8rem',
     color: 'var(--text-primary)',
+  },
+  modalOverlay: {
+    position: 'fixed',
+    inset: 0,
+    background: 'rgba(2,6,23,0.75)',
+    zIndex: 1100,
+    display: 'flex',
+    alignItems: 'center',
+    justifyContent: 'center',
+    padding: 16,
+  },
+  modalCard: {
+    width: 'min(880px, 96vw)',
+    maxHeight: '88vh',
+    background: 'var(--bg-card)',
+    border: '1px solid var(--border-color)',
+    borderRadius: 12,
+    padding: 12,
+    display: 'grid',
+    gridTemplateRows: 'auto auto 1fr',
+    gap: 10,
+  },
+  modalHeader: {
+    display: 'flex',
+    justifyContent: 'space-between',
+    alignItems: 'center',
+    gap: 12,
+  },
+  modalPathRow: {
+    display: 'grid',
+    gridTemplateColumns: 'auto 1fr',
+    gap: 8,
+    alignItems: 'center',
+  },
+  modalPathText: {
+    border: '1px solid var(--border-color)',
+    borderRadius: 8,
+    padding: '8px 10px',
+    fontSize: '0.78rem',
+    color: 'var(--text-secondary)',
+    overflow: 'hidden',
+    textOverflow: 'ellipsis',
+    whiteSpace: 'nowrap',
+  },
+  modalList: {
+    overflowY: 'auto',
+    border: '1px solid var(--border-color)',
+    borderRadius: 10,
+    padding: 8,
+    background: 'var(--bg-input)',
+    display: 'grid',
+    gap: 6,
+  },
+  modalEntry: {
+    background: 'var(--bg-elevated)',
+    color: 'var(--text-primary)',
+    border: '1px solid var(--border-color)',
+    borderRadius: 8,
+    padding: '8px 10px',
+    display: 'grid',
+    gridTemplateColumns: '20px 1fr',
+    gap: 8,
+    textAlign: 'left',
+    cursor: 'pointer',
+    fontSize: '0.82rem',
   },
 };
