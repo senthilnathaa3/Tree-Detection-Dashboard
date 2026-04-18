@@ -30,6 +30,10 @@ def postprocess_density_output(
         tph = max(0.0, float(density_raw))
         density = float(np.clip(tph / max(1e-6, max_tph_reference), 0.0, 1.0))
         return density, tph
+    if mode == "log_tph":
+        tph = max(0.0, float(np.expm1(float(density_raw))))
+        density = float(np.clip(tph / max(1e-6, max_tph_reference), 0.0, 1.0))
+        return density, tph
 
     density = float(np.clip(float(density_raw), 0.0, 1.0))
     tph = density * max_tph_reference

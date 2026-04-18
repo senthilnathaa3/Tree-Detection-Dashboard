@@ -161,6 +161,19 @@ export async function validateLocation(payload) {
     return response.json();
 }
 
+export async function validateLocationWithCrowns(payload) {
+    const response = await fetch(`${API_BASE}/validate-location-crowns`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload),
+    });
+    if (!response.ok) {
+        const error = await response.json().catch(() => ({ detail: 'Unknown error' }));
+        throw new Error(error.detail || 'Location validation + crown detection failed');
+    }
+    return response.json();
+}
+
 export async function fitRegionalCalibration(payload) {
     const response = await fetch(`${API_BASE}/fit-fia-calibration-regional`, {
         method: 'POST',

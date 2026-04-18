@@ -7,6 +7,7 @@ intended as an object-level visualization baseline.
 
 from __future__ import annotations
 
+import json
 import numpy as np
 import rasterio
 from typing import Any, Dict, List, Optional
@@ -27,6 +28,8 @@ def detect_tree_crowns_advanced(
     ndvi_threshold: float = 0.45,
     min_area_px: int = 12,
     model_tree_count: Optional[float] = None,
+    max_candidates: int = 5000,
+    include_geojson: bool = False,
 ) -> Dict[str, Any]:
     """
     Advanced tree crown detection using NDVI peak finding + watershed segmentation.
@@ -77,6 +80,7 @@ def detect_tree_crowns_advanced(
         score = float(np.max(ndvi[component_mask]))
         
         det = {
+            "crown_id": int(i),
             "bbox_px": {
                 "xmin": int(cmin),
                 "ymin": int(rmin),
@@ -107,8 +111,33 @@ def detect_tree_crowns_advanced(
         target_count = int(round(model_tree_count))
         if len(detections) > target_count:
             detections = detections[:target_count]
+    if max_candidates and max_candidates > 0 and len(detections) > int(max_candidates):
+        detections = detections[: int(max_candidates)]
 
-    return {
+    geojson = None
+    if include_geojson:
+        features = []
+        for d in detections:
+            centroid = d.get("centroid_geo")
+            if not centroid:
+                continue
+            features.append(
+                {
+                    "type": "Feature",
+                    "properties": {
+                        "crown_id": d.get("crown_id"),
+                        "score": d.get("score"),
+                        "area_px": d.get("area_px"),
+                    },
+                    "geometry": {
+                        "type": "Point",
+                        "coordinates": [centroid["x"], centroid["y"]],
+                    },
+                }
+            )
+        geojson = {"type": "FeatureCollection", "features": features}
+
+    out = {
         "method": "ndvi_peak_watershed",
         "ndvi_threshold": float(ndvi_threshold),
         "min_area_px": int(min_area_px),
@@ -118,6 +147,10 @@ def detect_tree_crowns_advanced(
         "crs": crs,
         "detections": detections,
     }
+    if geojson is not None:
+        out["detections_geojson"] = geojson
+        out["detections_geojson_text"] = json.dumps(geojson)
+    return out
 
 
 def detect_tree_crowns_ndvi(
@@ -127,4 +160,3 @@ def detect_tree_crowns_ndvi(
 ) -> Dict[str, Any]:
     """Legacy wrapper for compatibility."""
     return detect_tree_crowns_advanced(tif_path, ndvi_threshold, min_area_px)
-

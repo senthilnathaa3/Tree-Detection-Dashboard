@@ -140,7 +140,7 @@ class TreeSatMultiHeadModelV2(nn.Module):
     ):
         super().__init__()
         self.density_mode = (density_mode or "normalized").strip().lower()
-        density_output_act = nn.Identity() if self.density_mode == "tph" else nn.Sigmoid()
+        density_output_act = nn.Identity() if self.density_mode in {"tph", "log_tph"} else nn.Sigmoid()
         self.spectral_stem = SpectralStem(in_channels=in_channels, out_channels=32)
 
         self.backbone = resnet34(weights=None)

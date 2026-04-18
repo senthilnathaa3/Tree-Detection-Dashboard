@@ -6,6 +6,7 @@ Handles upload, predict, preview, batch, dataset analysis, and biodiversity endp
 import os
 import json
 import asyncio
+import tempfile
 from typing import Optional
 import numpy as np
 import rasterio
@@ -153,6 +154,14 @@ class RemoteGeoTiffFetchRequest(BaseModel):
     cloud_cover_max: float = 40.0
 
 
+class LocationValidationWithCrownsRequest(LocationValidationRequest):
+    crown_radius_km: float = 0.2
+    crown_ndvi_threshold: float = 0.45
+    crown_min_area_px: int = 12
+    crown_align_with_model: bool = True
+    crown_max_candidates: int = 5000
+
+
 def _validate_dataset_structure(dataset_path: str):
     if not os.path.isdir(dataset_path):
         raise HTTPException(status_code=400, detail=f"Dataset path not found: {dataset_path}")
@@ -216,6 +225,39 @@ def _model_summary_from_single_result(result: dict) -> dict:
         "mean_trees_per_hectare": result.get("trees_per_hectare", 0.0),
         "dominant_species_distribution": dominant_counts,
     }
+
+
+def _write_remote_tensor_to_tiff(tensor, metadata: dict, prefix: str = "remote_tmp_") -> str:
+    arr = tensor.squeeze(0).cpu().numpy().astype(np.float32)
+    if arr.ndim != 3 or arr.shape[0] < 2:
+        raise ValueError("Fetched tensor has invalid shape for GeoTIFF export.")
+
+    aoi = metadata.get("aoi", {})
+    west = aoi.get("west")
+    south = aoi.get("south")
+    east = aoi.get("east")
+    north = aoi.get("north")
+    if west is None or south is None or east is None or north is None:
+        raise ValueError("Missing AOI bounds in remote metadata.")
+
+    height, width = int(arr.shape[1]), int(arr.shape[2])
+    transform = transform_from_bounds(float(west), float(south), float(east), float(north), width, height)
+    profile = {
+        "driver": "GTiff",
+        "height": height,
+        "width": width,
+        "count": int(arr.shape[0]),
+        "dtype": "float32",
+        "crs": "EPSG:4326",
+        "transform": transform,
+        "compress": "lzw",
+    }
+
+    tmp_fd, out_path = tempfile.mkstemp(prefix=prefix, suffix=".tif", dir=UPLOAD_DIR)
+    os.close(tmp_fd)
+    with rasterio.open(out_path, "w", **profile) as dst:
+        dst.write(arr)
+    return out_path
 
 
 # ─── Browse Server Directories ──────────────────────────────────────────
@@ -952,6 +994,90 @@ async def validate_location(request: LocationValidationRequest):
     }
 
 
+@router.post("/validate-location-crowns")
+async def validate_location_crowns(request: LocationValidationWithCrownsRequest):
+    """
+    Unified pitch endpoint:
+    1) Run location validation/regression
+    2) Fetch remote patch and run crown candidate detection
+    """
+    base_payload = request.dict()
+    for k in [
+        "crown_radius_km",
+        "crown_ndvi_threshold",
+        "crown_min_area_px",
+        "crown_align_with_model",
+        "crown_max_candidates",
+    ]:
+        base_payload.pop(k, None)
+
+    validation_request = LocationValidationRequest(**base_payload)
+    validation = await validate_location(validation_request)
+
+    if not request.start_date or not request.end_date:
+        return {
+            "status": "success",
+            "validation": validation,
+            "crowns": {
+                "status": "not_run",
+                "reason": "start_date and end_date are required for crown detection remote fetch.",
+            },
+        }
+
+    # Compute optional target count from model summary/calibration for alignment.
+    model_target_count = None
+    if request.crown_align_with_model:
+        cal = validation.get("comparison", {}).get("density_agreement_calibrated", {})
+        model_summary = validation.get("model", {}).get("summary", {})
+        tph = cal.get("model_tph_calibrated")
+        if tph is None:
+            tph = model_summary.get("mean_trees_per_hectare")
+        if tph is not None:
+            crown_area_ha = (np.pi * (float(request.crown_radius_km) ** 2)) * 100.0
+            model_target_count = float(tph) * crown_area_ha
+
+    side_meters = request.crown_radius_km * 2000
+    target_res_meters = 10.0
+    pixels = int(min(1024, max(64, side_meters / target_res_meters)))
+    out_shape = (pixels, pixels)
+
+    try:
+        tensor, metadata = fetch_remote_tensor_planetary_computer(
+            lat=request.lat,
+            lon=request.lon,
+            start_date=request.start_date,
+            end_date=request.end_date,
+            radius_km=request.crown_radius_km,
+            cloud_cover_max=request.cloud_cover_max,
+            out_shape=out_shape,
+        )
+        temp_tif = _write_remote_tensor_to_tiff(tensor, metadata, prefix="crown_remote_")
+        crowns = detect_tree_crowns_advanced(
+            tif_path=temp_tif,
+            ndvi_threshold=request.crown_ndvi_threshold,
+            min_area_px=request.crown_min_area_px,
+            model_tree_count=model_target_count,
+            max_candidates=request.crown_max_candidates,
+            include_geojson=True,
+        )
+        crowns["remote_source"] = metadata
+        crowns["status"] = "success"
+    except Exception as e:
+        crowns = {"status": "error", "detail": str(e)}
+    finally:
+        if "temp_tif" in locals() and os.path.exists(temp_tif):
+            try:
+                os.remove(temp_tif)
+            except OSError:
+                pass
+
+    return {
+        "status": "success",
+        "validation": validation,
+        "crowns": crowns,
+    }
+
+
 @router.post("/convert-fia-datamart")
 async def convert_fia_datamart(request: FIADatamartConvertRequest):
     """
@@ -1055,6 +1181,8 @@ async def detect_crowns(
     ndvi_threshold: float = Query(0.45, ge=-1.0, le=1.0),
     min_area_px: int = Query(12, ge=1),
     model_tree_count: Optional[float] = Query(None, description="Optional target tree count from model to align object detection results."),
+    max_candidates: int = Query(5000, ge=1),
+    include_geojson: bool = Query(False),
 ):
     """
     Object-level tree crown candidate detection from an uploaded GeoTIFF.
@@ -1072,6 +1200,8 @@ async def detect_crowns(
             ndvi_threshold=ndvi_threshold,
             min_area_px=min_area_px,
             model_tree_count=model_tree_count,
+            max_candidates=max_candidates,
+            include_geojson=include_geojson,
         )
         result["filename"] = file.filename
         return result
